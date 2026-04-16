@@ -1,49 +1,61 @@
 # RoadReady
 
-RoadReady is an adaptive driving practice planner for teen drivers and parents. It turns driving logs into a focused practice plan by tracking skill progress, surfacing weak or overdue areas, recommending the next best skills to practice, and generating a demo-friendly nearby route plan.
+RoadReady is a driving-practice planner for teen drivers and parents. Instead of treating every session the same, it tracks actual practice history, identifies weak or overdue skills, and recommends the next best route and coaching focus.
 
-## What’s in this MVP
+## Hackathon Summary
 
-- Landing page with product framing and demo launch
-- Local credentials login with protected app routes and per-account demo state
-- Learner setup flow with role, state, experience level, and target test date
-- State-based skill checklist for California and New York
-- Session logger with per-skill ratings, conditions, notes, and parent comments
-- Skill progress engine that updates attempts, average ratings, confidence, and status
-- Gap analysis engine for readiness, overdue skills, and top-priority practice targets
-- Route recommendation page with skill-based practice stops and route rationale
-- Parent / instructor dashboard for comments, gaps, and coaching prompts
-- Gemini-powered session summaries and route guidance with rules-based fallbacks
+RoadReady helps families answer a simple but frustrating question: "What should we practice next?"
 
-## Stack
+Most teen driving practice is inconsistent. Important skills get skipped, parents do not always know what to coach, and learners repeat familiar routes instead of targeting their real gaps. RoadReady turns session logs into a focused practice plan by:
+
+- tracking driving sessions and per-skill confidence
+- surfacing weak, stale, or never-practiced skills
+- generating a nearby practice route based on those gaps
+- giving both teen and parent a shared view of readiness and next steps
+
+## What Makes It Useful
+
+- Adaptive practice planning instead of a static checklist
+- Shared teen and parent workflow with comments and review
+- Route generation tied to actual skill gaps
+- AI-assisted summaries and route guidance with rules-based fallbacks
+- Demo-friendly seeded data so judges can see value quickly
+
+## Core Features
+
+- Landing page and product overview
+- Local sign-in, account creation, and demo access
+- Learner onboarding with role, state, experience level, and test date
+- State-based checklist support for California and New York
+- Session logger with ratings, road types, conditions, notes, and parent comments
+- Progress and readiness engine for attempts, averages, confidence, and status
+- Gap analysis for weak, overdue, and never-attempted skills
+- Route recommendation flow with practice stops and route rationale
+- Parent dashboard for review, coaching prompts, and approval workflow
+
+## Tech Stack
 
 - Next.js 16 App Router
 - React 19
 - TypeScript
-- Local credentials auth with cookie sessions
-- Local-first seeded demo state stored in `localStorage`
+- Leaflet and React Leaflet for maps
+- Cookie-based local auth for demo access
+- Local-first browser state with seeded demo data
+- Gemini-compatible AI integration with fallback logic
 
-## Project Structure
+## Demo Flow
 
-```text
-app/
-  page.tsx                 Landing page
-  login/                   Sign-in and account creation page
-  app/                     Product experience pages
-  api/                     Demo API routes for summaries and routes
-components/
-  app-state.tsx            Shared client-side app state
-  dashboard/               Dashboard view
-  forms/                   Onboarding and session logging
-  routes/                  Route generation UI
-  shell/                   Sidebar app shell
-lib/
-  logic.ts                 Readiness, recommendation, and route logic
-  mock-data.ts             Seeded users, sessions, and state checklists
-  types.ts                 Shared app types
-```
+For a hackathon demo, the fastest path is:
 
-## Run Locally
+1. Open the landing page.
+2. Click into the login flow.
+3. Use the demo account to enter the seeded experience.
+4. Review the dashboard and recommended focus areas.
+5. Log a new driving session on `/app/sessions`.
+6. Generate a tailored route on `/app/routes`.
+7. Show the parent view on `/app/parent`.
+
+## Local Setup
 
 ```bash
 npm install
@@ -54,34 +66,65 @@ Then open [http://localhost:3000](http://localhost:3000).
 
 ## Optional AI Setup
 
-To enable AI summaries and AI-assisted route guidance, create `.env.local` with the variables in `.env.example`.
+AI is optional. The app still works without an API key by falling back to deterministic summaries and route heuristics.
 
-- `GEMINI_API_KEY` enables model-backed summaries and route guidance
-- `GEMINI_SESSION_MODEL` optionally overrides the session-summary model
-- `GEMINI_ROUTE_MODEL` optionally overrides the route-planning model
+If you want model-backed summaries and route guidance, create a `.env.local` file with:
 
-Without an API key, RoadReady falls back to deterministic summaries and route heuristics.
+```env
+GEMINI_API_KEY=your_key_here
+GEMINI_SESSION_MODEL=gemini-2.5-flash
+GEMINI_ROUTE_MODEL=gemini-2.5-flash
+```
 
-## Demo Story
+The app also accepts `OPENAI_API_KEY`, `OPENAI_SESSION_MODEL`, and `OPENAI_ROUTE_MODEL` as compatible fallbacks in the current implementation.
 
-1. Open the landing page and launch the demo.
-2. Review the seeded dashboard for readiness, weak skills, and recent sessions.
-3. Log a new driving session on `/app/sessions`.
-4. Watch the dashboard and recommendations update.
-5. Generate a tailored route on `/app/routes`.
-6. Show the parent view on `/app/parent`.
+## Available Scripts
 
-## Current Simplifications
+- `npm run dev` starts the local development server
+- `npm run build` creates a production build
+- `npm run start` runs the production server
+- `npm run typecheck` runs TypeScript checks
 
-- Authentication is local-first and file-backed for the demo rather than using a hosted auth provider.
-- DMV checklists are seeded for two states instead of pulling from a live official source.
-- Route generation depends on OpenStreetMap, Overpass, Photon, and OSRM instead of a dedicated production maps stack.
-- AI output is assistive only; the app still relies on route verification and local fallbacks so it works without API keys.
+## Project Structure
 
-## Future Upgrades
+```text
+app/
+  page.tsx                 Landing page
+  login/                   Sign-in and account creation page
+  app/                     Main product experience
+  api/                     Demo API routes for auth, summaries, and routes
+components/
+  app-state.tsx            Shared client-side app state
+  dashboard/               Dashboard view
+  forms/                   Onboarding and session logging
+  routes/                  Route generation UI
+  shell/                   App shell and navigation
+lib/
+  auth.ts                  Local auth and cookie session logic
+  logic.ts                 Readiness, recommendation, and progress logic
+  mock-data.ts             Seeded demo users, sessions, and checklists
+  route-generation.ts      Route generation and verification logic
+  types.ts                 Shared app types
+```
 
-- Hosted auth and persistence with Supabase or Firebase
-- Real household linking and role-based access
-- Live maps integration with Mapbox or Google Maps
-- Richer Gemini-powered coaching, reflection, and planning flows
-- Notifications, weather-aware planning, and readiness forecasting
+## Current Scope
+
+This is a hackathon MVP, so a few parts are intentionally simplified:
+
+- authentication is local and file-backed for demo purposes
+- checklist support is currently seeded for California and New York
+- route generation relies on OpenStreetMap, Overpass, Photon, and OSRM
+- AI output is assistive, not authoritative
+- long-term persistence is not yet backed by a hosted database
+
+## What We Would Build Next
+
+- Hosted auth and database persistence
+- Support for more states and official checklist sources
+- Stronger household linking and role-based collaboration
+- Production-grade maps stack with better routing controls
+- Richer coaching, forecasting, reminders, and progress analytics
+
+## Submission Notes
+
+For judging, the most important idea is that RoadReady does not just log practice. It helps families decide what to practice next, why it matters, and where to do it.
