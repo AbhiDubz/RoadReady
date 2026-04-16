@@ -26,7 +26,7 @@ Most teen driving practice is inconsistent. Important skills get skipped, parent
 - Landing page and product overview
 - Local sign-in, account creation, and demo access
 - Learner onboarding with role, state, experience level, and test date
-- State-based checklist support for California and New York
+- All 50 states supported in onboarding with a shared DMV-style driving skill framework and state-aware defaults
 - Session logger with ratings, road types, conditions, notes, and parent comments
 - Progress and readiness engine for attempts, averages, confidence, and status
 - Gap analysis for weak, overdue, and never-attempted skills
@@ -112,7 +112,7 @@ lib/
 This is a hackathon MVP, so a few parts are intentionally simplified:
 
 - authentication is local and file-backed for demo purposes
-- checklist support is currently seeded for California and New York
+- all 50 states are available today through a shared skill framework; official state-by-state checklist rules are a next step
 - route generation relies on OpenStreetMap, Overpass, Photon, and OSRM
 - AI output is assistive, not authoritative
 - long-term persistence is not yet backed by a hosted database
@@ -120,7 +120,7 @@ This is a hackathon MVP, so a few parts are intentionally simplified:
 ## What We Would Build Next
 
 - Hosted auth and database persistence
-- Support for more states and official checklist sources
+- Official state-by-state checklist sources and rule differences
 - Stronger household linking and role-based collaboration
 - Production-grade maps stack with better routing controls
 - Richer coaching, forecasting, reminders, and progress analytics
@@ -128,3 +128,5 @@ This is a hackathon MVP, so a few parts are intentionally simplified:
 ## Submission Notes
 
 For judging, the most important idea is that RoadReady does not just log practice. It helps families decide what to practice next, why it matters, and where to do it.
+
+For a copy-pasteable hackathon submission writeup, see [PROJECT_STORY.md](./PROJECT_STORY.md).
