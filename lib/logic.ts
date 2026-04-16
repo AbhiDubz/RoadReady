@@ -1,6 +1,7 @@
 import {
   AppState,
   CategoryCoverage,
+  ParentCategorySummary,
   PracticeSession,
   ReadinessSnapshot,
   Recommendation,
@@ -8,9 +9,11 @@ import {
   RouteRequest,
   RouteStop,
   SessionInput,
+  SkillInsight,
   SkillDefinition,
   SkillProgress,
   SkillStatus,
+  SkillTrend,
   UserProfile
 } from "@/lib/types";
 import { getStateMetadataByCode } from "@/lib/mock-data";
@@ -33,12 +36,22 @@ function daysSince(date?: string): number {
   return Math.max(0, Math.floor((now - then) / (1000 * 60 * 60 * 24)));
 }
 
+function daysUntil(date?: string): number | undefined {
+  if (!date) {
+    return undefined;
+  }
+
+  const then = new Date(date).getTime();
+  const now = new Date("2026-04-14T12:00:00").getTime();
+  return Math.ceil((then - now) / (1000 * 60 * 60 * 24));
+}
+
 function getSkillStatus(attemptsCount: number, averageRating: number, lastPracticedAt?: string): SkillStatus {
   if (attemptsCount === 0) {
     return "not_attempted";
   }
 
-  if (attemptsCount >= 3 && averageRating >= 4 && daysSince(lastPracticedAt) <= 14) {
+  if (attemptsCount >= 3 && averageRating >= 2.6 && daysSince(lastPracticedAt) <= 14) {
     return "confident";
   }
 
@@ -62,9 +75,7 @@ export function recomputeProgress(
     const averageRating = average(attempts.map((attempt) => attempt.rating));
     const lastPracticedAt = attempts.at(-1)?.date;
     const recencyPenalty = Math.min(daysSince(lastPracticedAt) / 21, 1);
-    const confidenceScore = Number(
-      Math.max(0, Math.min(100, averageRating * 20 + attemptsCount * 8 - recencyPenalty * 20)).toFixed(0)
-    );
+    const confidenceScore = Number(Math.max(0, Math.min(100, averageRating / 3 * 72 + attemptsCount * 9 - recencyPenalty * 20)).toFixed(0));
 
     return {
       skillId: skill.id,
@@ -84,12 +95,17 @@ export function createSessionRecord(input: SessionInput): PracticeSession {
     durationMinutes: input.durationMinutes,
     areaDriven: input.areaDriven,
     roadTypes: input.roadTypes,
-    practicedSkills: input.skillRatings,
+    practicedSkills: input.skillRatings.map((entry) => ({
+      skillId: entry.skillId,
+      teenRating: entry.rating,
+      rating: entry.rating
+    })),
     notes: input.notes,
     parentComment: input.parentComment,
     weather: input.weather,
     trafficLevel: input.trafficLevel,
-    conditions: input.conditions
+    conditions: input.conditions,
+    reviewStatus: input.parentComment ? "reviewed" : "pending"
   };
 }
 
@@ -119,6 +135,29 @@ export function getCategoryCoverage(
   });
 }
 
+export function getParentCategorySummaries(
+  skills: SkillDefinition[],
+  progress: SkillProgress[]
+): ParentCategorySummary[] {
+  return getCategoryCoverage(skills, progress).map((entry) => {
+    const categorySkills = skills.filter((skill) => skill.category === entry.category);
+    const categoryProgress = progress.filter((item) => categorySkills.some((skill) => skill.id === item.skillId));
+    const weakSkillsCount = categoryProgress.filter((item) => item.status !== "confident").length;
+    const status = categoryProgress.every((item) => item.status === "confident")
+      ? "confident"
+      : categoryProgress.some((item) => item.attemptsCount > 0)
+        ? "needs_work"
+        : "not_attempted";
+
+    return {
+      category: entry.category,
+      coveragePercent: entry.coverageScore,
+      status,
+      weakSkillsCount
+    };
+  });
+}
+
 export function getRecommendations(
   profile: UserProfile,
   skills: SkillDefinition[],
@@ -130,7 +169,7 @@ export function getRecommendations(
     .map((entry) => {
       const skill = skills.find((item) => item.id === entry.skillId)!;
       const neverAttempted = entry.attemptsCount === 0 ? 40 : 0;
-      const confidenceGap = Math.max(0, 5 - entry.averageRating) * 12;
+      const confidenceGap = Math.max(0, 3 - entry.averageRating) * 20;
       const recencyGap = Math.min(daysSince(entry.lastPracticedAt) * 2, 30);
       const testBoost = skill.requiredForTest ? 18 : 6;
       const priorityScore = Math.round(neverAttempted + confidenceGap + recencyGap + testBoost + targetDateBoost);
@@ -139,11 +178,11 @@ export function getRecommendations(
       if (entry.attemptsCount === 0) {
         reasons.push("Never practiced yet");
       }
-      if (entry.averageRating > 0 && entry.averageRating < 3.5) {
+      if (entry.averageRating > 0 && entry.averageRating < 2.3) {
         reasons.push("Recent ratings are still low");
       }
       if (daysSince(entry.lastPracticedAt) > 10) {
-        reasons.push("Overdue for another repetition");
+        reasons.push(`Not practiced in ${daysSince(entry.lastPracticedAt)} days`);
       }
       if (skill.requiredForTest) {
         reasons.push("Important for the road test");
@@ -162,6 +201,7 @@ export function getRecommendations(
 
 export function getReadinessSnapshot(state: AppState): ReadinessSnapshot {
   const coverage = getCategoryCoverage(state.skills, state.progress);
+  const categorySummaries = getParentCategorySummaries(state.skills, state.progress);
   const recommendations = getRecommendations(state.profile, state.skills, state.progress);
   const overdueSkills = state.progress.filter((entry) => daysSince(entry.lastPracticedAt) > 10);
   const totalHours = Number(
@@ -175,14 +215,120 @@ export function getReadinessSnapshot(state: AppState): ReadinessSnapshot {
   );
   const consistencyScore = Math.max(30, 100 - overdueSkills.length * 10);
   const readinessScore = Math.round(coverageAverage * 0.35 + criticalScore * 0.45 + consistencyScore * 0.2);
+  const lastSessionDate = state.sessions[0]?.date;
 
   return {
     readinessScore,
     totalHours,
     overdueSkills,
     topRecommendations: recommendations.slice(0, 3),
-    coverage
+    coverage,
+    categorySummaries,
+    lastSessionDate,
+    targetTestCountdownDays: daysUntil(state.profile.targetTestDate)
   };
+}
+
+export function getSkillTrend(skillId: string, sessions: PracticeSession[]): SkillTrend {
+  const ratings = sessions
+    .flatMap((session) =>
+      session.practicedSkills
+        .filter((entry) => entry.skillId === skillId)
+        .map((entry) => ({ date: session.date, rating: entry.rating }))
+    )
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((entry) => entry.rating);
+
+  if (ratings.length < 2) {
+    return "not_enough_data";
+  }
+
+  const recent = ratings.slice(-3);
+  const delta = recent.at(-1)! - recent[0]!;
+
+  if (delta >= 1) {
+    return "improving";
+  }
+
+  if (delta <= -1) {
+    return "declining";
+  }
+
+  return "stagnant";
+}
+
+export function getSkillInsights(state: AppState): SkillInsight[] {
+  return state.skills.map((skill) => {
+    const progress = state.progress.find((entry) => entry.skillId === skill.id);
+    const parentComments = state.sessions
+      .flatMap((session) =>
+        session.practicedSkills
+          .filter((entry) => entry.skillId === skill.id)
+          .map((entry) => entry.parentComment)
+          .filter((comment): comment is string => Boolean(comment))
+      )
+      .concat(
+        state.sessions
+          .filter(
+            (session) =>
+              session.parentComment &&
+              session.practicedSkills.some((entry) => entry.skillId === skill.id)
+          )
+          .map((session) => session.parentComment)
+      );
+
+    return {
+      skillId: skill.id,
+      label: skill.label,
+      category: skill.category,
+      attemptsCount: progress?.attemptsCount ?? 0,
+      averageRating: progress?.averageRating ?? 0,
+      lastPracticedAt: progress?.lastPracticedAt,
+      trend: getSkillTrend(skill.id, state.sessions),
+      parentComments: [...new Set(parentComments)].slice(0, 3)
+    };
+  });
+}
+
+export function buildNotifications(state: AppState): string[] {
+  const readiness = getReadinessSnapshot(state);
+  const notes: string[] = [];
+  const latestSession = state.sessions[0];
+  const pendingReview = state.sessions.find((session) => session.reviewStatus === "pending");
+  const basicControlSummary = readiness.categorySummaries.find((entry) => entry.category === "Basic Control");
+
+  if (!latestSession || daysSince(latestSession.date) > 7) {
+    notes.push("No session has been logged in the last 7 days.");
+  }
+
+  if (pendingReview) {
+    notes.push(`A session from ${pendingReview.date} is waiting for parent review.`);
+  }
+
+  if (state.planning.requireRouteApproval && state.latestRoute?.approvalStatus === "pending") {
+    notes.push("A new route is waiting for parent approval.");
+  }
+
+  if (readiness.overdueSkills[0]) {
+    const overdueSkill = state.skills.find((skill) => skill.id === readiness.overdueSkills[0]?.skillId);
+    if (overdueSkill) {
+      notes.push(`${overdueSkill.label} has not been practiced recently.`);
+    }
+  }
+
+  if (basicControlSummary?.coveragePercent === 100) {
+    notes.push("Milestone reached: all Basic Control skills have been practiced.");
+  }
+
+  if (readiness.targetTestCountdownDays !== undefined) {
+    if (readiness.targetTestCountdownDays >= 0) {
+      notes.push(`${readiness.targetTestCountdownDays} days remain until the target test date.`);
+    } else {
+      notes.push("The target test date has passed. Review the plan and set a new date.");
+    }
+  }
+
+  return notes.slice(0, 5);
 }
 
 type RouteLibraryEntry = {
@@ -521,8 +667,9 @@ export function generateRoutePlan(
     generationSource: "rules-based",
     routingSource: "straight-line",
     warnings: [
-      "Live map verification was unavailable for this fallback route, so every stop is only an approximate practice area. Open each stop in Maps before using it for a skill-specific drive."
-    ]
+      "RoadReady could not confirm a full road-mapped route for this start point, so this fallback loop uses approximate practice areas. Open each stop in Maps before using it for a skill-specific drive."
+    ],
+    approvalStatus: "pending"
   };
 }
 
@@ -571,11 +718,11 @@ export function buildSessionSummary(
 ): string {
   const sorted = [...input.skillRatings].sort((a, b) => b.rating - a.rating);
   const strengths = sorted
-    .filter((entry) => entry.rating >= 4)
+    .filter((entry) => entry.rating >= 3)
     .map((entry) => skills.find((skill) => skill.id === entry.skillId)?.label.toLowerCase())
     .filter(Boolean);
   const weakSpots = sorted
-    .filter((entry) => entry.rating <= 3)
+    .filter((entry) => entry.rating <= 2)
     .map((entry) => skills.find((skill) => skill.id === entry.skillId)?.label.toLowerCase())
     .filter(Boolean);
 

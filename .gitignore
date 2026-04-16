@@ -4,4 +4,4 @@ dist
 coverage
 *.log
 .env.local
-
+data/auth-store.json

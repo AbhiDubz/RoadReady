@@ -30,7 +30,7 @@ function buildGoogleMapsUrl(latitude: number, longitude: number) {
 function describeStopVerification(stop: RoutePlan["segments"][number]) {
   return stop.verificationStatus === "verified"
     ? "Map-verified practice feature"
-    : "Approximate practice area; preview this stop in Maps before driving it.";
+    : "Legacy approximate stop from an older route version.";
 }
 
 function FitRouteBounds({ points }: { points: LatLngExpression[] }) {
@@ -84,7 +84,7 @@ export function PracticeMap({ route }: { route: RoutePlan }) {
             <br />
             {route.startLocation}
             <br />
-            {route.routingSource === "road-route" ? "Road-following route enabled" : "Straight-line fallback route"}
+            {route.routingSource === "road-route" ? "Verified road-following route enabled" : "Legacy straight-line fallback route"}
             <br />
             <a
               href={buildGoogleMapsUrl(route.startLatitude, route.startLongitude)}

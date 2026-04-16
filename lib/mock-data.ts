@@ -1,4 +1,5 @@
 import {
+  AuthAccount,
   AppState,
   OnboardingInput,
   PracticeSession,
@@ -6,6 +7,7 @@ import {
   SkillProgress,
   UserProfile
 } from "@/lib/types";
+import { buildOwnedHouseholdInviteCode, normalizeHouseholdInviteCode } from "@/lib/household";
 
 type StateMetadata = {
   code: string;
@@ -46,7 +48,7 @@ const baseSkills: Omit<SkillDefinition, "stateCode">[] = [
     label: "Unprotected left turns",
     description: "Judge gaps, keep wheels straight, and complete the turn smoothly.",
     requiredForTest: true,
-    routeTags: ["busy-intersection", "signalized-left"]
+    routeTags: ["signalized-left", "busy-intersection"]
   },
   {
     id: "lane-change",
@@ -171,7 +173,8 @@ const demoProfile: UserProfile = {
   experienceLevel: "intermediate",
   targetTestDate: "2026-05-02",
   householdName: "Chen Family",
-  householdInviteCode: "READY-247",
+  householdInviteCode: buildOwnedHouseholdInviteCode("teen-1"),
+  householdOwnerId: "teen-1",
   linkedTeenName: "Maya Chen",
   completedOnboarding: true
 };
@@ -184,15 +187,20 @@ export const demoSessions: PracticeSession[] = [
     areaDriven: "Sunnyvale residential loop",
     roadTypes: ["Residential", "Neighborhood arterials"],
     practicedSkills: [
-      { skillId: "smooth-braking", rating: 4 },
-      { skillId: "lane-position", rating: 4 },
-      { skillId: "four-way-stop", rating: 3 }
+      { skillId: "smooth-braking", teenRating: 3, rating: 3 },
+      { skillId: "lane-position", teenRating: 3, rating: 3 },
+      { skillId: "four-way-stop", teenRating: 2, rating: 2 }
     ],
     notes: "Felt calmer than last week. Still hesitated at one busy stop.",
     parentComment: "Good awareness overall. Work on committing earlier at intersections.",
     weather: "Clear",
     trafficLevel: "Light",
-    conditions: ["afternoon"]
+    conditions: ["afternoon"],
+    reviewStatus: "verified",
+    reviewedAt: "2026-04-05",
+    reviewedByName: "Chris Chen",
+    verifiedAt: "2026-04-05",
+    verifiedByName: "Chris Chen"
   },
   {
     id: "session-2",
@@ -201,15 +209,18 @@ export const demoSessions: PracticeSession[] = [
     areaDriven: "El Camino corridor",
     roadTypes: ["Multi-lane arterial", "Signalized intersections"],
     practicedSkills: [
-      { skillId: "lane-change", rating: 3 },
-      { skillId: "unprotected-left", rating: 2 },
-      { skillId: "lane-position", rating: 4 }
+      { skillId: "lane-change", teenRating: 2, rating: 2 },
+      { skillId: "unprotected-left", teenRating: 1, rating: 1, parentComment: "Still hesitates waiting for a clean gap." },
+      { skillId: "lane-position", teenRating: 3, rating: 3 }
     ],
     notes: "Traffic was heavier. Left turns felt stressful.",
     parentComment: "Lane changes looked safer. Left-turn gap judgment still needs reps.",
     weather: "Clear",
     trafficLevel: "Medium",
-    conditions: ["rush hour"]
+    conditions: ["rush hour"],
+    reviewStatus: "reviewed",
+    reviewedAt: "2026-04-10",
+    reviewedByName: "Chris Chen"
   },
   {
     id: "session-3",
@@ -218,25 +229,30 @@ export const demoSessions: PracticeSession[] = [
     areaDriven: "101 southbound practice",
     roadTypes: ["Highway", "On-ramp", "Surface streets"],
     practicedSkills: [
-      { skillId: "highway-merge", rating: 2 },
-      { skillId: "lane-change", rating: 3 },
-      { skillId: "smooth-braking", rating: 4 }
+      { skillId: "highway-merge", teenRating: 1, rating: 1 },
+      { skillId: "lane-change", teenRating: 2, rating: 2 },
+      { skillId: "smooth-braking", teenRating: 3, rating: 3 }
     ],
     notes: "Needed coaching to match ramp speed before merging.",
     parentComment: "Biggest gap is still merging assertively without braking on the ramp.",
     weather: "Cloudy",
     trafficLevel: "Medium",
-    conditions: ["evening"]
+    conditions: ["evening"],
+    reviewStatus: "pending"
   }
 ];
 
-export function createProfileFromOnboarding(input: OnboardingInput): UserProfile {
+export function createProfileFromOnboarding(input: OnboardingInput, account?: AuthAccount): UserProfile {
+  const householdInviteCode = normalizeHouseholdInviteCode(input.householdInviteCode ?? "");
+
   return {
-    id: "teen-1",
+    ...input,
+    id: account?.id ?? "teen-1",
     completedOnboarding: true,
-    linkedTeenName: input.role === "parent" ? "Teen learner" : input.name,
-    householdInviteCode: "READY-247",
-    ...input
+    householdOwnerId: account?.id ?? "teen-1",
+    linkedTeenName: input.name,
+    householdInviteCode: householdInviteCode || undefined,
+    role: "teen"
   };
 }
 
@@ -248,6 +264,13 @@ export function createDemoState(): AppState {
     skills,
     progress: createEmptyProgress(skills),
     sessions: demoSessions,
+    planning: {
+      selectedSkillIds: ["highway-merge", "unprotected-left", "lane-change"],
+      preferredDifficulty: "balanced",
+      preferredSessionDurationMinutes: 45,
+      requireParentApprovalForConfident: false,
+      requireRouteApproval: true
+    },
     coachTip:
       "Practice assertive but calm merges on a lower-traffic freeway entrance before repeating them in busier conditions.",
     notifications: [

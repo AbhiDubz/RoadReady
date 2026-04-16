@@ -5,7 +5,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAppState } from "@/components/app-state";
 import type { LocationSuggestion } from "@/lib/location-search";
-import { generateRoutePlan, getRecommendations } from "@/lib/logic";
+import { getRecommendations } from "@/lib/logic";
 import { getStateMetadataByCode } from "@/lib/mock-data";
 import { DifficultyLevel } from "@/lib/types";
 
@@ -64,8 +64,46 @@ function isApproximateStop(stop?: {
   return stop?.source === "fallback" || stop?.verificationStatus === "approximate";
 }
 
+function buildRouteFeedbackDetail(route?: {
+  generationSource?: "ai-assisted" | "rules-based";
+  routingSource?: "road-route" | "straight-line";
+  segments?: Array<{
+    source?: "resolved" | "fallback";
+    verificationStatus?: "verified" | "approximate";
+  }>;
+}) {
+  if (!route) {
+    return "RoadReady is using AI to plan candidate maneuvers, expand nearby search anchors, and verify each stop against map data.";
+  }
+
+  if (route.routingSource === "road-route") {
+    return route.generationSource === "ai-assisted"
+      ? "AI planned the maneuver sequence, generated alternate nearby search anchors, and RoadReady map-verified every stop before building turn-by-turn directions."
+      : "RoadReady map-verified each stop and connected the route with road directions.";
+  }
+
+  return "This saved route came from an older fallback path. Generate a fresh route to get the verified AI route engine.";
+}
+
+function buildRouteSuccessMessage(route: {
+  generationSource?: "ai-assisted" | "rules-based";
+  routingSource?: "road-route" | "straight-line";
+  segments?: Array<{
+    source?: "resolved" | "fallback";
+    verificationStatus?: "verified" | "approximate";
+  }>;
+}) {
+  if (route.routingSource !== "road-route") {
+    return "Legacy fallback route loaded.";
+  }
+
+  return route.generationSource === "ai-assisted"
+    ? "AI-planned verified route ready."
+    : "Verified route ready.";
+}
+
 export function RouteBuilder() {
-  const { state, readiness, saveRoute, isPending } = useAppState();
+  const { account, state, readiness, saveRoute, updatePlanning, isPending } = useAppState();
   const stateMetadata = getStateMetadataByCode(state.profile.stateCode);
   const defaultStartLocation = `${stateMetadata.defaultCity}, ${state.profile.stateCode}`;
   const defaultStartCoordinates = {
@@ -78,7 +116,7 @@ export function RouteBuilder() {
     latitude: number;
     longitude: number;
   } | null>(defaultStartCoordinates);
-  const [difficulty, setDifficulty] = useState<DifficultyLevel>("balanced");
+  const [difficulty, setDifficulty] = useState<DifficultyLevel>(state.planning.preferredDifficulty);
   const [isLocating, setIsLocating] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [locationMessage, setLocationMessage] = useState<string | null>(null);
@@ -87,9 +125,12 @@ export function RouteBuilder() {
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
   const [isGeneratingRoute, setIsGeneratingRoute] = useState(false);
   const [routeFeedback, setRouteFeedback] = useState<string | null>(null);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const [selectionMessage, setSelectionMessage] = useState<string | null>(null);
   const [activeSkillIds, setActiveSkillIds] = useState<string[]>(
-    readiness.topRecommendations.map((item) => item.skillId).slice(0, 2)
+    state.planning.selectedSkillIds.length
+      ? state.planning.selectedSkillIds.slice(0, 3)
+      : readiness.topRecommendations.map((item) => item.skillId).slice(0, 3)
   );
   const searchContainerRef = useRef<HTMLDivElement>(null);
 
@@ -103,6 +144,14 @@ export function RouteBuilder() {
     setStartLocationQuery(defaultStartLocation);
     setStartCoordinates(defaultStartCoordinates);
   }, [defaultStartLocation, stateMetadata.latitude, stateMetadata.longitude]);
+
+  useEffect(() => {
+    if (state.planning.selectedSkillIds.length) {
+      setActiveSkillIds(state.planning.selectedSkillIds.slice(0, 3));
+    }
+
+    setDifficulty(state.planning.preferredDifficulty);
+  }, [state.planning.preferredDifficulty, state.planning.selectedSkillIds]);
 
   const quickLocationSuggestions = useMemo(
     () =>
@@ -199,8 +248,9 @@ export function RouteBuilder() {
         return current;
       }
 
+      const next = [...current, skillId];
       setSelectionMessage(null);
-      return [...current, skillId];
+      return next;
     });
   }
 
@@ -262,6 +312,11 @@ export function RouteBuilder() {
   }
 
   async function handleGenerate() {
+    updatePlanning({
+      selectedSkillIds: activeSkillIds,
+      preferredDifficulty: difficulty
+    });
+
     const payload = {
       skills: state.skills,
       recommendations,
@@ -275,30 +330,34 @@ export function RouteBuilder() {
     };
 
     setIsGeneratingRoute(true);
-    setRouteFeedback("Generating your route and directions...");
+    setRouteFeedback("Building your practice route...");
+    setRouteError(null);
 
     try {
-      try {
-        const response = await fetch("/api/routes/generate", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(payload)
-        });
+      const response = await fetch("/api/routes/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
 
-        if (response.ok) {
-          const data = await response.json();
-          saveRoute(data.route);
-          setRouteFeedback("Route generated with directions.");
-          return;
-        }
-      } catch {
-        // Fall back to local route generation below.
+      const data = (await response.json().catch(() => ({}))) as {
+        message?: string;
+        route?: (typeof state.latestRoute);
+      };
+
+      if (!response.ok || !data.route) {
+        setRouteFeedback(null);
+        setRouteError(
+          data.message ??
+            "RoadReady could not generate a verified route for that start point. Try a more specific address or intersection."
+        );
+        return;
       }
 
-      saveRoute(generateRoutePlan(state.skills, recommendations, payload.request));
-      setRouteFeedback("Route generated using fallback routing.");
+      saveRoute(data.route);
+      setRouteFeedback(buildRouteSuccessMessage(data.route));
       return;
     } finally {
       setIsGeneratingRoute(false);
@@ -354,7 +413,7 @@ export function RouteBuilder() {
           </div>
           <span className="route-status-pill">
             {isGeneratingRoute
-              ? "Generating route..."
+              ? "Building route..."
               : latestRoute
                 ? `Generated ${formatGeneratedTime(latestRoute.createdAt)}`
                 : "Ready to search"}
@@ -363,6 +422,14 @@ export function RouteBuilder() {
 
         <div className="route-builder-layout">
           <div className="route-builder-main">
+            {latestRoute?.generationSource === "ai-assisted" ? (
+              <div className="route-feedback-banner">
+                <strong>AI-powered route plan</strong>
+                <span>
+                  AI selected the maneuver strategy, drafted alternate nearby search anchors, and wrote the coaching summary. RoadReady only shows the route after map-verifying each stop and connecting it to road directions.
+                </span>
+              </div>
+            ) : null}
             <div className="form-grid route-form-grid">
               <label className="full-width">
                 <span>Start location</span>
@@ -452,7 +519,14 @@ export function RouteBuilder() {
               </label>
               <label>
                 <span>Difficulty</span>
-                <select value={difficulty} onChange={(event) => setDifficulty(event.target.value as DifficultyLevel)}>
+                <select
+                  value={difficulty}
+                  onChange={(event) => {
+                    const nextDifficulty = event.target.value as DifficultyLevel;
+                    setDifficulty(nextDifficulty);
+                    updatePlanning({ preferredDifficulty: nextDifficulty });
+                  }}
+                >
                   <option value="gentle">Gentle</option>
                   <option value="balanced">Balanced</option>
                   <option value="stretch">Stretch</option>
@@ -489,15 +563,38 @@ export function RouteBuilder() {
               disabled={isPending || isGeneratingRoute || activeSkillIds.length === 0}
               onClick={handleGenerate}
             >
-              {isGeneratingRoute ? "Generating route..." : "Generate recommended route"}
+              {isGeneratingRoute ? "Building route..." : "Generate recommended route"}
             </button>
+            {isGeneratingRoute ? (
+              <div className="route-generation-card" aria-live="polite">
+                <div className="route-generation-spinner" aria-hidden="true" />
+                <div className="route-generation-copy">
+                  <strong>Building the route now</strong>
+                  <span>
+                    AI is planning the maneuver sequence, expanding nearby search options, and verifying each stop before RoadReady connects the full road route.
+                  </span>
+                </div>
+              </div>
+            ) : null}
             {routeFeedback ? (
               <div className="route-feedback-banner">
                 <strong>{routeFeedback}</strong>
+                <span>{buildRouteFeedbackDetail(latestRoute)}</span>
+              </div>
+            ) : null}
+            {routeError ? (
+              <div className="route-feedback-banner" style={{ borderColor: "rgba(248, 113, 113, 0.32)", background: "linear-gradient(180deg, rgba(127, 29, 29, 0.28), rgba(14, 27, 49, 0.92))" }}>
+                <strong>Verified route unavailable</strong>
+                <span>{routeError}</span>
+              </div>
+            ) : null}
+            {state.planning.requireRouteApproval && latestRoute?.approvalStatus === "pending" ? (
+              <div className="route-feedback-banner">
+                <strong>Waiting for parent approval</strong>
                 <span>
-                  {latestRoute?.generationSource === "ai-assisted"
-                    ? "AI selected the practice stops and road routing filled in the directions."
-                    : "RoadReady generated the route with its built-in planner."}
+                  {account.role === "parent"
+                    ? "Review this route in Parent View and approve, reject, or request changes."
+                    : "This route stays in review until a parent or instructor approves it."}
                 </span>
               </div>
             ) : null}
@@ -506,17 +603,25 @@ export function RouteBuilder() {
           <aside className="route-builder-sidebar">
             <div className="route-callout-card">
               <span className="eyebrow">How it works</span>
-              <strong>Search, select, generate</strong>
+              <strong>AI plan, map verify, drive</strong>
               <p className="subtle-text">
-                Live place suggestions help you start from the right area, then RoadReady builds a focused loop around
-                your weakest skills.
+                Live place suggestions get you to the right area, AI plans the best nearby maneuver mix, and RoadReady verifies every stop before drawing the route.
               </p>
             </div>
             <div className="route-callout-card">
               <span className="eyebrow">Best results</span>
-              <strong>Try a real neighborhood or intersection</strong>
+              <strong>Give the AI a strong starting point</strong>
               <p className="subtle-text">
-                More specific places usually produce better practice stops and a cleaner map route.
+                Real intersections, neighborhood entries, and freeway access roads give the planner better nearby maneuvers to verify.
+              </p>
+            </div>
+            <div className="route-callout-card">
+              <span className="eyebrow">Approval flow</span>
+              <strong>{state.planning.requireRouteApproval ? "Parent approval is on" : "Route approval is optional"}</strong>
+              <p className="subtle-text">
+                {state.planning.requireRouteApproval
+                  ? "Newly generated routes stay pending until a parent or instructor approves them."
+                  : "Generated routes are ready to use as soon as they are created."}
               </p>
             </div>
           </aside>
@@ -534,7 +639,7 @@ export function RouteBuilder() {
                   <span className="route-ai-pill">Powered by AI</span>
                 ) : null}
                 <span className="route-engine-pill">
-                  {latestRoute.routingSource === "road-route" ? "Road directions ready" : "Straight-line fallback"}
+                  {latestRoute.routingSource === "road-route" ? "Verified road route" : "Legacy fallback"}
                 </span>
               </div>
             </div>
@@ -546,8 +651,9 @@ export function RouteBuilder() {
               <h2>Why this route was chosen</h2>
               <div className="route-panel-meta">
                 <span className="subtle-text">{latestRoute.difficulty} difficulty</span>
+                <span className="route-engine-pill">{latestRoute.approvalStatus.replace("_", " ")}</span>
                 {latestRoute.generationSource === "ai-assisted" ? (
-                  <span className="route-ai-pill">AI-assisted planner</span>
+                  <span className="route-ai-pill">AI planner + map verification</span>
                 ) : (
                   <span className="route-engine-pill">Rules-based planner</span>
                 )}
@@ -560,6 +666,11 @@ export function RouteBuilder() {
               </div>
             ) : null}
             <p className="route-explanation">{latestRoute.explanation}</p>
+            {latestRoute.coachNote ? (
+              <p className="insight-block" style={{ marginTop: 12 }}>
+                Coach note: {latestRoute.coachNote}
+              </p>
+            ) : null}
             <p>
               <a
                 href={buildGoogleMapsUrl(latestRoute.startLatitude, latestRoute.startLongitude)}
@@ -589,7 +700,7 @@ export function RouteBuilder() {
                           {leg.fromLabel} to {leg.toLabel}
                         </p>
                         {isApproximateStop(targetSegment) ? (
-                          <span className="route-warning-pill">Approximate stop</span>
+                          <span className="route-warning-pill">Legacy approximate stop</span>
                         ) : null}
                         {targetSegment?.focusSkillLabels?.length ? (
                           <p className="route-focus-line">Targets: {targetSegment.focusSkillLabels.join(", ")}</p>
@@ -630,7 +741,7 @@ export function RouteBuilder() {
                     <div key={segment.id} className="timeline-item">
                       <strong>{segment.title}</strong>
                       {isApproximateStop(segment) ? (
-                        <span className="route-warning-pill">Approximate stop</span>
+                        <span className="route-warning-pill">Legacy approximate stop</span>
                       ) : null}
                       {segment.focusSkillLabels?.length ? (
                         <p className="route-focus-line">Targets: {segment.focusSkillLabels.join(", ")}</p>

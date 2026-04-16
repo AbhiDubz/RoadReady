@@ -1,4 +1,3 @@
-import { generateRoutePlan } from "@/lib/logic";
 import {
   Recommendation,
   RouteCoordinate,
@@ -9,33 +8,35 @@ import {
   RouteStop,
   SkillDefinition
 } from "@/lib/types";
+import { generateStructuredObject } from "@/lib/openai";
+
+export class RouteGenerationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RouteGenerationError";
+  }
+}
 
 type SuggestedStop = {
   title: string;
   searchQuery: string;
   reason: string;
   tag: string;
+  alternateQueries?: string[];
   skillId?: string;
   skillLabel?: string;
   source?: "ai" | "heuristic";
+};
+
+type RouteGuidance = {
+  coachNote: string;
+  explanation: string;
 };
 
 type GeocodeResult = {
   latitude: number;
   longitude: number;
   address: string;
-};
-
-type RawFallbackStop = {
-  skillId: string;
-  skillLabel: string;
-  tag: string;
-  title: string;
-  reason: string;
-  address: string;
-  etaMinutes: number;
-  latitude: number;
-  longitude: number;
 };
 
 type OsrmRouteResponse = {
@@ -76,12 +77,34 @@ type OverpassElement = {
   id: number;
   lat?: number;
   lon?: number;
+  nodes?: number[];
   center?: {
     lat: number;
     lon: number;
   };
   tags?: Record<string, string>;
 };
+
+type FeatureMatch = {
+  point: Pick<GeocodeResult, "latitude" | "longitude">;
+  addressHint?: string;
+  verificationStatus: "verified" | "approximate";
+};
+
+type RoadWay = OverpassElement & { type: "way"; nodes: number[] };
+
+type RoadTopology = {
+  nodeElements: Map<number, OverpassElement & { type: "node"; lat: number; lon: number }>;
+  roadWays: RoadWay[];
+  waysById: Map<number, RoadWay>;
+  wayIdsByNode: Map<number, Set<number>>;
+};
+
+type ScoredFeatureCandidate = FeatureMatch & {
+  score: number;
+};
+
+type TurnDirection = "forward" | "backward";
 
 function parseCoordinateLocation(startLocation: string) {
   const match = startLocation.trim().match(
@@ -171,12 +194,45 @@ const stopDescriptors: Record<
   }
 };
 
-const strictFeatureTags = new Set([
-  "highway-on-ramp",
-  "freeway-connector",
-  "busy-intersection",
-  "signalized-left"
-]);
+const ROUTE_STOP_SUGGESTION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    stops: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: { type: "string" },
+          searchQuery: { type: "string" },
+          reason: { type: "string" },
+          tag: { type: "string" },
+          alternateQueries: {
+            type: "array",
+            items: { type: "string" }
+          }
+        },
+        required: ["title", "searchQuery", "reason", "tag"]
+      }
+    }
+  },
+  required: ["stops"]
+} as const;
+
+const ROUTE_GUIDANCE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    explanation: {
+      type: "string"
+    },
+    coachNote: {
+      type: "string"
+    }
+  },
+  required: ["explanation", "coachNote"]
+} as const;
 
 type SkillTarget = {
   skillId: string;
@@ -185,10 +241,6 @@ type SkillTarget = {
   tags: string[];
   primaryTag: string;
 };
-
-function isStrictSkillTarget(target: SkillTarget) {
-  return target.skillId === "four-way-stop" || target.tags.some((tag) => strictFeatureTags.has(tag));
-}
 
 function formatSkillLabelList(labels: string[]) {
   if (labels.length <= 1) {
@@ -200,6 +252,10 @@ function formatSkillLabelList(labels: string[]) {
   }
 
   return `${labels.slice(0, -1).join(", ")}, and ${labels.at(-1)}`;
+}
+
+function normalizeQueryList(queries: Array<string | null | undefined>) {
+  return [...new Set(queries.map((query) => query?.trim()).filter((query): query is string => Boolean(query)))];
 }
 
 function canonicalizeTags(skills: SkillDefinition[], request: RouteRequest) {
@@ -249,7 +305,39 @@ function buildSkillFocusedTitle(tag: string, focusLabels: string[]) {
 }
 
 function extractCity(startLocation: string) {
-  return startLocation.split(",")[0]?.trim() || startLocation.trim();
+  const locationParts = startLocation
+    .split(",")
+    .map((part) => part.trim())
+    .filter(
+      (part) =>
+        Boolean(part) &&
+        !/^\d{5}(?:-\d{4})?$/.test(part) &&
+        !/^(united states|usa)$/i.test(part)
+    );
+
+  if (locationParts.length >= 2) {
+    return locationParts[locationParts.length - 2] ?? startLocation.trim();
+  }
+
+  return locationParts[0] ?? startLocation.trim();
+}
+
+function buildLocationSearchContext(startLocation: string) {
+  const locationParts = startLocation
+    .split(",")
+    .map((part) => part.trim())
+    .filter(
+      (part) =>
+        Boolean(part) &&
+        !/^\d{5}(?:-\d{4})?$/.test(part) &&
+        !/^(united states|usa)$/i.test(part)
+    );
+
+  if (locationParts.length >= 2) {
+    return locationParts.slice(-2).join(", ");
+  }
+
+  return locationParts[0] ?? startLocation.trim();
 }
 
 function buildHeuristicStops(
@@ -257,6 +345,7 @@ function buildHeuristicStops(
   skillTargets: SkillTarget[]
 ): SuggestedStop[] {
   const city = extractCity(startLocation);
+  const locationSearchContext = buildLocationSearchContext(startLocation);
 
   return skillTargets.map((target) => {
     const tag = target.primaryTag;
@@ -271,7 +360,12 @@ function buildHeuristicStops(
       skillId: target.skillId,
       skillLabel: target.skillLabel,
       title: `${city} ${target.skillLabel} practice`.trim(),
-      searchQuery: `${descriptor.searchHint} near ${startLocation}`,
+      searchQuery: `${descriptor.searchHint} near ${locationSearchContext}`,
+      alternateQueries: normalizeQueryList([
+        `${target.skillLabel} practice route near ${locationSearchContext}`,
+        `${descriptor.title} near ${locationSearchContext}`,
+        `${descriptor.searchHint} in ${city}`
+      ]),
       reason: `Targets ${target.skillLabel}. ${target.skillDescription}`,
       source: "heuristic"
     };
@@ -304,9 +398,34 @@ function buildCandidateStopsForSkills(
       skillId: target.skillId,
       skillLabel: target.skillLabel,
       tag: target.tags.includes(matchingAiStop.tag) ? matchingAiStop.tag : target.primaryTag,
+      alternateQueries: normalizeQueryList([
+        ...(matchingAiStop.alternateQueries ?? []),
+        heuristicStops[index]?.searchQuery,
+        ...(heuristicStops[index]?.alternateQueries ?? [])
+      ]),
       source: "ai" as const
     };
   });
+}
+
+function normalizeSuggestedStops(stops: SuggestedStop[] | null | undefined) {
+  if (!Array.isArray(stops)) {
+    return [];
+  }
+
+  return stops
+    .filter(
+      (stop) =>
+        typeof stop?.title === "string" &&
+        typeof stop?.searchQuery === "string" &&
+        typeof stop?.reason === "string" &&
+        typeof stop?.tag === "string"
+    )
+    .map((stop) => ({
+      ...stop,
+      alternateQueries: normalizeQueryList(stop.alternateQueries ?? [])
+    }))
+    .slice(0, 4);
 }
 
 async function suggestStopsWithOpenAI(
@@ -314,82 +433,83 @@ async function suggestStopsWithOpenAI(
   recommendations: Recommendation[],
   tags: string[]
 ): Promise<SuggestedStop[] | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return null;
-  }
-
-  const model = process.env.OPENAI_ROUTE_MODEL ?? "gpt-4.1-mini";
+  const model = process.env.GEMINI_ROUTE_MODEL ?? process.env.OPENAI_ROUTE_MODEL ?? "gemini-2.5-flash";
   const priorityLabels = recommendations
     .filter((entry) => request.skillIds.includes(entry.skillId))
     .map((entry) => entry.label)
     .slice(0, 4);
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      instructions:
-        "You generate nearby driving-practice stop suggestions. Return only valid JSON. " +
-        "Choose public, drivable road locations near the provided starting area. " +
-        "Avoid parks, golf courses, private campuses, trails, bodies of water, parking lots unless the skill explicitly needs curb parking, and vague non-road landmarks. " +
-        "Each stop needs a human-readable title, a geocodable searchQuery, a short reason, and the provided tag.",
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text:
-                `Start location: ${request.startLocation}\n` +
-                `Difficulty: ${request.difficulty}\n` +
-                `Priority skills: ${priorityLabels.join(", ") || "general practice"}\n` +
-                `Canonical route tags: ${tags.join(", ")}\n` +
-                'Return JSON with shape {"stops":[{"title":"...","searchQuery":"...","reason":"...","tag":"..."}]}. ' +
-                "Return 3 to 4 stops total."
-            }
-          ]
-        }
-      ],
-      text: {
-        format: {
-          type: "json_object"
-        }
-      }
-    })
+  const parsed = await generateStructuredObject<{ stops: SuggestedStop[] }>({
+    model,
+    reasoningEffort: "low",
+    schemaName: "roadready_route_stop_suggestions",
+    schema: ROUTE_STOP_SUGGESTION_SCHEMA,
+    maxOutputTokens: 420,
+    instructions:
+      "You generate nearby driving-practice stop suggestions for a teen driving coach app. " +
+      "Choose public, drivable road locations near the provided starting area. " +
+      "Avoid parks, trails, golf courses, private campuses, parking lots, bodies of water, or vague landmarks unless curbside parking is explicitly relevant. " +
+      "Each stop must have a human-readable title, a geocodable search query, one or two alternate geocodable phrasings, a grounded reason, and one of the provided canonical tags. " +
+      "Prefer safer, repeatable reps over flashy or risky roads.",
+    prompt:
+      `Start location: ${request.startLocation}\n` +
+      `Difficulty: ${request.difficulty}\n` +
+      `Priority skills: ${priorityLabels.join(", ") || "general practice"}\n` +
+      `Canonical route tags: ${tags.join(", ")}\n` +
+      "Return 3 to 4 stop suggestions."
   });
 
-  if (!response.ok) {
+  if (!Array.isArray(parsed?.stops)) {
     return null;
   }
 
-  const data = (await response.json()) as { output_text?: string };
-  if (!data.output_text) {
+  return normalizeSuggestedStops(parsed.stops);
+}
+
+async function suggestStopRetriesWithOpenAI(
+  request: RouteRequest,
+  target: SkillTarget,
+  candidate: SuggestedStop
+) {
+  const model = process.env.GEMINI_ROUTE_MODEL ?? process.env.OPENAI_ROUTE_MODEL ?? "gemini-2.5-flash";
+  const parsed = await generateStructuredObject<{ stops: SuggestedStop[] }>({
+    model,
+    reasoningEffort: "low",
+    schemaName: "roadready_route_stop_retries",
+    schema: ROUTE_STOP_SUGGESTION_SCHEMA,
+    maxOutputTokens: 320,
+    instructions:
+      "You help recover a failed driving-route search for a teen driving practice app. " +
+      "Return 2 or 3 nearby public-road alternatives for the one skill provided. " +
+      "Keep every candidate within the same general metro area as the start location. " +
+      "Avoid private campuses, parking lots, trailheads, vague landmarks, and anything that is not a road feature someone could verify in maps. " +
+      "Use only the allowed canonical tags and give each result a geocodable search query plus one or two alternate phrasings.",
+    prompt:
+      `Start location: ${request.startLocation}\n` +
+      `Difficulty: ${request.difficulty}\n` +
+      `Target skill: ${target.skillLabel}\n` +
+      `Skill description: ${target.skillDescription}\n` +
+      `Allowed tags: ${target.tags.join(", ")}\n` +
+      `Failed search query: ${candidate.searchQuery}\n` +
+      `Existing alternate queries: ${JSON.stringify(candidate.alternateQueries ?? [])}\n` +
+      "Return only stronger nearby alternatives for this one skill."
+  });
+
+  if (!Array.isArray(parsed?.stops)) {
     return null;
   }
 
-  try {
-    const parsed = JSON.parse(data.output_text) as { stops?: SuggestedStop[] };
-    if (!Array.isArray(parsed.stops)) {
-      return null;
-    }
-
-    return parsed.stops
-      .filter(
-        (stop) =>
-          typeof stop?.title === "string" &&
-          typeof stop?.searchQuery === "string" &&
-          typeof stop?.reason === "string" &&
-          typeof stop?.tag === "string"
-      )
-      .slice(0, 4);
-  } catch {
-    return null;
-  }
+  return normalizeSuggestedStops(parsed.stops).map((stop) => ({
+    ...stop,
+    skillId: target.skillId,
+    skillLabel: target.skillLabel,
+    tag: target.tags.includes(stop.tag) ? stop.tag : target.primaryTag,
+    alternateQueries: normalizeQueryList([
+      ...(stop.alternateQueries ?? []),
+      candidate.searchQuery,
+      ...(candidate.alternateQueries ?? [])
+    ]),
+    source: "ai" as const
+  }));
 }
 
 function buildViewbox(latitude: number, longitude: number) {
@@ -463,16 +583,94 @@ function buildExplanation(request: RouteRequest, recommendations: Recommendation
   )}. It favors public-road segments that should be easier to open in maps and practice repeatedly.`;
 }
 
-function buildFallbackTitle(tag: string, focusLabels: string[]) {
-  const primaryFocus = focusLabels[0];
-  if (primaryFocus) {
-    return `Approximate ${primaryFocus} practice`;
+function buildFallbackCoachNote(route: Pick<RoutePlan, "difficulty" | "segments">) {
+  const firstFocus = route.segments[0]?.focusSkillLabels?.[0]?.toLowerCase();
+  const firstStop = route.segments[0]?.title;
+
+  if (firstFocus && firstStop) {
+    return `Start with ${firstStop} to settle into ${firstFocus}, then keep the loop short enough to repeat the toughest section while attention is still fresh.`;
   }
 
-  return `Approximate ${stopDescriptors[tag]?.title.toLowerCase() ?? "practice area"}`;
+  return route.difficulty === "stretch"
+    ? "Preview the route in Maps first, then pause after the hardest segment if the learner starts to sound overloaded."
+    : "Preview the route in Maps first and repeat the hardest segment once more if the learner is still calm and focused.";
 }
 
-function getOverpassPoint(element: OverpassElement) {
+async function buildRouteGuidanceWithOpenAI(
+  request: RouteRequest,
+  recommendations: Recommendation[],
+  route: Pick<RoutePlan, "difficulty" | "segments"> & { estimatedMinutes: number }
+) {
+  const model = process.env.GEMINI_ROUTE_MODEL ?? process.env.OPENAI_ROUTE_MODEL ?? "gemini-2.5-flash";
+  const selectedRecommendations = recommendations
+    .filter((entry) => request.skillIds.includes(entry.skillId))
+    .map((entry) => ({
+      label: entry.label,
+      reasons: entry.reasons
+    }));
+  const segmentSummary = route.segments.map((segment, index) => ({
+    stop: index + 1,
+    title: segment.title,
+    address: segment.address,
+    reason: segment.reason,
+    focusSkillLabels: segment.focusSkillLabels ?? [],
+    verificationStatus: segment.verificationStatus ?? "verified"
+  }));
+  const guidance = await generateStructuredObject<RouteGuidance>({
+    model,
+    reasoningEffort: "low",
+    schemaName: "roadready_route_guidance",
+    schema: ROUTE_GUIDANCE_SCHEMA,
+    maxOutputTokens: 260,
+    instructions:
+      "You write grounded route explanations for a teen driving practice app. " +
+      "Stay tightly anchored to the verified route stops, priorities, and duration provided. " +
+      "Keep the explanation to 2 concise sentences and the coach note to 1 concise sentence. " +
+      "Do not claim turn-by-turn guarantees, legal compliance, or safety certainty.",
+    prompt:
+      `Start location: ${request.startLocation}\n` +
+      `Difficulty: ${route.difficulty}\n` +
+      `Estimated minutes: ${route.estimatedMinutes}\n` +
+      `Priority skills and reasons: ${JSON.stringify(selectedRecommendations)}\n` +
+      `Verified route stops: ${JSON.stringify(segmentSummary)}\n`
+  });
+
+  if (!guidance?.explanation?.trim() || !guidance.coachNote?.trim()) {
+    return null;
+  }
+
+  return {
+    explanation: guidance.explanation.trim(),
+    coachNote: guidance.coachNote.trim()
+  };
+}
+
+const fourWayStopRoadPattern = /^(primary|secondary|tertiary|unclassified|residential|living_street)$/;
+const majorRoadPattern = /^(trunk|primary|secondary|tertiary)$/;
+const highSpeedRoadPattern = /^(motorway|trunk|motorway_link|trunk_link)$/;
+const rampRoadPattern = /^(motorway_link|trunk_link)$/;
+const surfaceRoadPattern = /^(primary|secondary|tertiary|unclassified|residential|living_street)$/;
+const arterialRoadPattern = /^(primary|secondary|tertiary)$/;
+const residentialRoadPattern = /^(residential|living_street|unclassified)$/;
+const maxFourWayStopLineDistanceKm = 0.045;
+
+function buildNodeElementMap(elements: OverpassElement[]) {
+  return new Map(
+    elements
+      .filter(
+        (element): element is OverpassElement & { type: "node"; lat: number; lon: number } =>
+          element.type === "node" &&
+          typeof element.lat === "number" &&
+          typeof element.lon === "number"
+      )
+      .map((element) => [element.id, element])
+  );
+}
+
+function getOverpassPoint(
+  element: OverpassElement,
+  nodeElements?: Map<number, OverpassElement & { type: "node"; lat: number; lon: number }>
+) {
   if (typeof element.lat === "number" && typeof element.lon === "number") {
     return {
       latitude: element.lat,
@@ -487,7 +685,1153 @@ function getOverpassPoint(element: OverpassElement) {
     };
   }
 
+  if (element.type === "way" && Array.isArray(element.nodes) && nodeElements?.size) {
+    const midpointNode = nodeElements.get(element.nodes[Math.floor(element.nodes.length / 2)]);
+    if (midpointNode) {
+      return {
+        latitude: midpointNode.lat,
+        longitude: midpointNode.lon
+      };
+    }
+  }
+
   return null;
+}
+
+function isRoadWay(
+  element: OverpassElement,
+  highwayPattern: RegExp
+): element is RoadWay {
+  return (
+    element.type === "way" &&
+    Array.isArray(element.nodes) &&
+    Boolean(element.tags?.highway && highwayPattern.test(element.tags.highway))
+  );
+}
+
+function buildIntersectionLabel(roadNames: string[]) {
+  const uniqueRoadNames = [...new Set(roadNames.map((name) => name.trim()).filter(Boolean))];
+  if (uniqueRoadNames.length < 2) {
+    return null;
+  }
+
+  return `${uniqueRoadNames[0]} & ${uniqueRoadNames[1]}`;
+}
+
+function isStopControlNode(
+  element: OverpassElement
+): element is OverpassElement & { type: "node"; lat: number; lon: number } {
+  return (
+    element.type === "node" &&
+    typeof element.lat === "number" &&
+    typeof element.lon === "number" &&
+    (element.tags?.highway === "stop" || element.tags?.traffic_sign === "stop")
+  );
+}
+
+function isLocalIntersectionRoadType(highway?: string) {
+  return Boolean(highway && /^(tertiary|unclassified|residential|living_street)$/.test(highway));
+}
+
+function getWayName(way: RoadWay) {
+  return way.tags?.name?.trim() || way.tags?.ref?.trim() || null;
+}
+
+function buildRoadTopology(elements: OverpassElement[], highwayPattern: RegExp): RoadTopology {
+  const nodeElements = buildNodeElementMap(elements);
+  const roadWays = elements.filter((element): element is RoadWay => isRoadWay(element, highwayPattern));
+  const waysById = new Map<number, RoadWay>();
+  const wayIdsByNode = new Map<number, Set<number>>();
+
+  for (const way of roadWays) {
+    waysById.set(way.id, way);
+    for (const nodeId of way.nodes) {
+      const connectedWayIds = wayIdsByNode.get(nodeId) ?? new Set<number>();
+      connectedWayIds.add(way.id);
+      wayIdsByNode.set(nodeId, connectedWayIds);
+    }
+  }
+
+  return {
+    nodeElements,
+    roadWays,
+    waysById,
+    wayIdsByNode
+  };
+}
+
+function getConnectedWays(topology: RoadTopology, nodeId: number, excludeWayId?: number) {
+  return [...(topology.wayIdsByNode.get(nodeId) ?? [])]
+    .filter((wayId) => wayId !== excludeWayId)
+    .map((wayId) => topology.waysById.get(wayId))
+    .filter((way): way is RoadWay => Boolean(way));
+}
+
+function parseNumericTag(value?: string) {
+  if (!value) {
+    return null;
+  }
+
+  const match = value.match(/\d+/);
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(match[0], 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getLaneCountFromTurnLanes(value?: string) {
+  if (!value) {
+    return null;
+  }
+
+  return value.split("|").length;
+}
+
+function getTotalLaneCount(tags?: Record<string, string>) {
+  const explicitLanes = parseNumericTag(tags?.lanes);
+  if (explicitLanes) {
+    return explicitLanes;
+  }
+
+  const forwardLanes = parseNumericTag(tags?.["lanes:forward"]);
+  const backwardLanes = parseNumericTag(tags?.["lanes:backward"]);
+  if (forwardLanes || backwardLanes) {
+    return (forwardLanes ?? 0) + (backwardLanes ?? 0);
+  }
+
+  const directTurnLaneCount = getLaneCountFromTurnLanes(tags?.["turn:lanes"]);
+  if (directTurnLaneCount) {
+    return directTurnLaneCount;
+  }
+
+  const directionalTurnLaneCount =
+    (getLaneCountFromTurnLanes(tags?.["turn:lanes:forward"]) ?? 0) +
+    (getLaneCountFromTurnLanes(tags?.["turn:lanes:backward"]) ?? 0);
+  return directionalTurnLaneCount || null;
+}
+
+function getMaxDirectionalLaneCount(tags?: Record<string, string>) {
+  return Math.max(
+    parseNumericTag(tags?.["lanes:forward"]) ?? 0,
+    parseNumericTag(tags?.["lanes:backward"]) ?? 0,
+    getLaneCountFromTurnLanes(tags?.["turn:lanes:forward"]) ?? 0,
+    getLaneCountFromTurnLanes(tags?.["turn:lanes:backward"]) ?? 0,
+    tags?.oneway === "yes" ? getTotalLaneCount(tags) ?? 0 : 0
+  );
+}
+
+function countLeftTurnLanes(tags?: Record<string, string>) {
+  const turnLaneValues = [
+    tags?.["turn:lanes"],
+    tags?.["turn:lanes:forward"],
+    tags?.["turn:lanes:backward"]
+  ].filter((value): value is string => Boolean(value));
+
+  return turnLaneValues.reduce((count, value) => {
+    const laneCount = value
+      .split("|")
+      .filter((lane) => lane.split(";").some((token) => token.trim() === "left")).length;
+    return Math.max(count, laneCount);
+  }, 0);
+}
+
+function hasLeftToken(value?: string) {
+  if (!value) {
+    return false;
+  }
+
+  return value
+    .split("|")
+    .some((lane) => lane.split(";").some((token) => token.trim() === "left"));
+}
+
+function getLeftTurnDirections(tags?: Record<string, string>) {
+  const forward = hasLeftToken(tags?.["turn:lanes:forward"]);
+  const backward = hasLeftToken(tags?.["turn:lanes:backward"]);
+  const undirected = hasLeftToken(tags?.["turn:lanes"]);
+  const isOneWay = tags?.oneway === "yes";
+
+  if (forward || backward) {
+    return {
+      forward: forward || (undirected && isOneWay),
+      backward
+    };
+  }
+
+  if (undirected) {
+    return {
+      forward: true,
+      backward: !isOneWay
+    };
+  }
+
+  return {
+    forward: false,
+    backward: false
+  };
+}
+
+function toRadians(value: number) {
+  return (value * Math.PI) / 180;
+}
+
+function toDegrees(value: number) {
+  return (value * 180) / Math.PI;
+}
+
+function getBearingDegrees(
+  from: Pick<GeocodeResult, "latitude" | "longitude">,
+  to: Pick<GeocodeResult, "latitude" | "longitude">
+) {
+  const latitude1 = toRadians(from.latitude);
+  const latitude2 = toRadians(to.latitude);
+  const deltaLongitude = toRadians(to.longitude - from.longitude);
+
+  const y = Math.sin(deltaLongitude) * Math.cos(latitude2);
+  const x =
+    Math.cos(latitude1) * Math.sin(latitude2) -
+    Math.sin(latitude1) * Math.cos(latitude2) * Math.cos(deltaLongitude);
+
+  return (toDegrees(Math.atan2(y, x)) + 360) % 360;
+}
+
+function normalizeSignedAngle(angle: number) {
+  let normalized = angle;
+
+  while (normalized > 180) {
+    normalized -= 360;
+  }
+
+  while (normalized <= -180) {
+    normalized += 360;
+  }
+
+  return normalized;
+}
+
+function hasProtectedLeftSignalMetadata(tags?: Record<string, string>) {
+  if (!tags) {
+    return false;
+  }
+
+  return Object.entries(tags).some(([key, value]) => {
+    const normalizedKey = key.trim().toLowerCase();
+    const normalizedValue = value.trim().toLowerCase();
+    const isSignalRelated =
+      normalizedKey.includes("traffic_signal") ||
+      normalizedKey.includes("traffic_signals") ||
+      normalizedKey.includes("signal");
+
+    if (!isSignalRelated) {
+      return false;
+    }
+
+    return (
+      /protected|arrow|left_turn|leftturn/.test(normalizedKey) ||
+      /protected|left arrow|green arrow/.test(normalizedValue)
+    );
+  });
+}
+
+function interpolatePoint(
+  from: Pick<GeocodeResult, "latitude" | "longitude">,
+  to: Pick<GeocodeResult, "latitude" | "longitude">,
+  fraction: number
+) {
+  return {
+    latitude: from.latitude + (to.latitude - from.latitude) * fraction,
+    longitude: from.longitude + (to.longitude - from.longitude) * fraction
+  };
+}
+
+function buildPointPastIntersection(
+  intersectionNodeId: number,
+  nextNodeId: number,
+  topology: RoadTopology,
+  distanceMeters = 45
+) {
+  const intersectionNode = topology.nodeElements.get(intersectionNodeId);
+  const nextNode = topology.nodeElements.get(nextNodeId);
+
+  if (!intersectionNode || !nextNode) {
+    return null;
+  }
+
+  const segmentDistanceKm = distanceKm(
+    { latitude: intersectionNode.lat, longitude: intersectionNode.lon },
+    { latitude: nextNode.lat, longitude: nextNode.lon }
+  );
+
+  if (segmentDistanceKm === 0) {
+    return {
+      latitude: nextNode.lat,
+      longitude: nextNode.lon
+    };
+  }
+
+  const fraction = Math.min((distanceMeters / 1000) / segmentDistanceKm, 0.82);
+
+  return interpolatePoint(
+    { latitude: intersectionNode.lat, longitude: intersectionNode.lon },
+    { latitude: nextNode.lat, longitude: nextNode.lon },
+    fraction
+  );
+}
+
+function getWayNeighborNodeIds(way: RoadWay, nodeId: number) {
+  const nodeIndex = way.nodes.indexOf(nodeId);
+
+  if (nodeIndex === -1) {
+    return [];
+  }
+
+  return [
+    nodeIndex > 0 ? way.nodes[nodeIndex - 1] : undefined,
+    nodeIndex < way.nodes.length - 1 ? way.nodes[nodeIndex + 1] : undefined
+  ].filter((candidate): candidate is number => typeof candidate === "number");
+}
+
+function getApproachNodeForDirection(
+  way: RoadWay,
+  nodeId: number,
+  direction: TurnDirection
+) {
+  const nodeIndex = way.nodes.indexOf(nodeId);
+
+  if (nodeIndex === -1) {
+    return null;
+  }
+
+  if (direction === "forward") {
+    return nodeIndex > 0 ? way.nodes[nodeIndex - 1] : null;
+  }
+
+  return nodeIndex < way.nodes.length - 1 ? way.nodes[nodeIndex + 1] : null;
+}
+
+function findUnprotectedLeftTurnCandidate(
+  signalNode: OverpassElement & { type: "node"; lat: number; lon: number },
+  connectedWays: RoadWay[],
+  topology: RoadTopology
+) {
+  const signalPoint = {
+    latitude: signalNode.lat,
+    longitude: signalNode.lon
+  };
+
+  const candidates = connectedWays
+    .flatMap((approachWay) => {
+      const approachName = getWayName(approachWay);
+      const leftTurnDirections = getLeftTurnDirections(approachWay.tags);
+      const approachDirections: TurnDirection[] = [];
+
+      if (leftTurnDirections.forward) {
+        approachDirections.push("forward");
+      }
+
+      if (leftTurnDirections.backward) {
+        approachDirections.push("backward");
+      }
+
+      return approachDirections.flatMap((direction) => {
+        const approachNodeId = getApproachNodeForDirection(approachWay, signalNode.id, direction);
+        const approachNode = approachNodeId ? topology.nodeElements.get(approachNodeId) : null;
+
+        if (!approachNode || !approachName) {
+          return [];
+        }
+
+        const approachBearing = getBearingDegrees(
+          { latitude: approachNode.lat, longitude: approachNode.lon },
+          signalPoint
+        );
+
+        return connectedWays
+          .filter((candidateWay) => candidateWay.id !== approachWay.id)
+          .flatMap((destinationWay) => {
+            const destinationName = getWayName(destinationWay);
+
+            if (!destinationName || destinationName === approachName) {
+              return [];
+            }
+
+            return getWayNeighborNodeIds(destinationWay, signalNode.id)
+              .map((neighborNodeId) => {
+                const destinationNode = topology.nodeElements.get(neighborNodeId);
+
+                if (!destinationNode) {
+                  return null;
+                }
+
+                const outgoingBearing = getBearingDegrees(signalPoint, {
+                  latitude: destinationNode.lat,
+                  longitude: destinationNode.lon
+                });
+                const turnAngle = normalizeSignedAngle(outgoingBearing - approachBearing);
+
+                if (turnAngle < 35 || turnAngle > 170) {
+                  return null;
+                }
+
+                const point = buildPointPastIntersection(signalNode.id, neighborNodeId, topology);
+                if (!point) {
+                  return null;
+                }
+
+                const approachHighway = approachWay.tags?.highway ?? "";
+                const destinationHighway = destinationWay.tags?.highway ?? "";
+                const leftTurnLanes = countLeftTurnLanes(approachWay.tags);
+                const totalLanes = getTotalLaneCount(approachWay.tags) ?? 0;
+                const approachDirectionalLanes =
+                  getMaxDirectionalLaneCount(approachWay.tags) || totalLanes;
+                const destinationDirectionalLanes =
+                  getMaxDirectionalLaneCount(destinationWay.tags) ||
+                  getTotalLaneCount(destinationWay.tags) ||
+                  0;
+                const approachMaxSpeed = parseMaxSpeed(approachWay.tags) ?? 0;
+                const destinationMaxSpeed = parseMaxSpeed(destinationWay.tags) ?? 0;
+                const bothRoadsAreMajor =
+                  /^(primary|secondary)$/.test(approachHighway) &&
+                  /^(primary|secondary)$/.test(destinationHighway);
+
+                if (leftTurnLanes === 0 || leftTurnLanes > 1) {
+                  return null;
+                }
+
+                if (/^trunk$/.test(approachHighway) || /^trunk$/.test(destinationHighway)) {
+                  return null;
+                }
+
+                if (approachDirectionalLanes > 3 || destinationDirectionalLanes > 4) {
+                  return null;
+                }
+
+                if (approachMaxSpeed > 40 || destinationMaxSpeed > 45) {
+                  return null;
+                }
+
+                if (bothRoadsAreMajor && (approachDirectionalLanes >= 3 || destinationDirectionalLanes >= 3)) {
+                  return null;
+                }
+
+                const calmApproachBonus =
+                  /^(tertiary|unclassified|residential|living_street)$/.test(approachHighway)
+                    ? 10
+                    : approachHighway === "secondary"
+                      ? 4
+                      : 0;
+                const calmDestinationBonus =
+                  /^(tertiary|unclassified|residential|living_street)$/.test(destinationHighway)
+                    ? 8
+                    : destinationHighway === "secondary"
+                      ? 3
+                      : 0;
+                const lanePenalty =
+                  Math.max(0, approachDirectionalLanes - 2) * 8 +
+                  Math.max(0, destinationDirectionalLanes - 2) * 5;
+                const speedPenalty = Math.max(0, approachMaxSpeed - 30) + Math.max(0, destinationMaxSpeed - 35);
+                const majorRoadPenalty = bothRoadsAreMajor ? 12 : /^(primary|secondary)$/.test(approachHighway) ? 4 : 0;
+
+                return {
+                  point,
+                  addressHint: `Left from ${approachName} onto ${destinationName}`,
+                  verificationStatus: "verified" as const,
+                  score:
+                    42 +
+                    calmApproachBonus +
+                    calmDestinationBonus +
+                    Math.round((180 - Math.abs(90 - turnAngle)) / 10) -
+                    lanePenalty -
+                    Math.round(speedPenalty / 4) -
+                    majorRoadPenalty
+                };
+              })
+              .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+          });
+      });
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return candidates[0] ?? null;
+}
+
+function parseMaxSpeed(tags?: Record<string, string>) {
+  return parseNumericTag(tags?.maxspeed);
+}
+
+function hasPositiveParkingTag(tags?: Record<string, string>) {
+  if (!tags) {
+    return false;
+  }
+
+  return Object.entries(tags).some(([key, value]) => {
+    if (!key.startsWith("parking")) {
+      return false;
+    }
+
+    const normalizedValue = value.trim().toLowerCase();
+    return normalizedValue !== "no" && normalizedValue !== "none";
+  });
+}
+
+function hasLitTag(tags?: Record<string, string>) {
+  if (!tags?.lit) {
+    return false;
+  }
+
+  return tags.lit.trim().toLowerCase() !== "no";
+}
+
+function buildRoadAddressHint(way: RoadWay) {
+  return getWayName(way) ?? undefined;
+}
+
+function selectBestFeatureCandidate(
+  candidates: ScoredFeatureCandidate[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  const rankedCandidates = candidates
+    .map((candidate) => ({
+      ...candidate,
+      distanceFromStart: distanceKm(startPoint, candidate.point),
+      distanceFromExisting: existingStops.length
+        ? Math.min(
+            ...existingStops.map((segment) =>
+              distanceKm(
+                { latitude: segment.latitude, longitude: segment.longitude },
+                candidate.point
+              )
+            )
+          )
+        : Number.POSITIVE_INFINITY
+    }))
+    .filter((candidate) => candidate.distanceFromExisting > 0.2)
+    .sort((a, b) => b.score - a.score || a.distanceFromStart - b.distanceFromStart);
+
+  const bestCandidate = rankedCandidates[0];
+  if (!bestCandidate) {
+    return null;
+  }
+
+  return {
+    point: bestCandidate.point,
+    addressHint: bestCandidate.addressHint,
+    verificationStatus: bestCandidate.verificationStatus
+  } satisfies FeatureMatch;
+}
+
+function findVerifiedRoadSegmentMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[],
+  options: {
+    highwayPattern: RegExp;
+    buildCandidate: (
+      way: RoadWay,
+      topology: RoadTopology,
+      point: Pick<GeocodeResult, "latitude" | "longitude">
+    ) => ScoredFeatureCandidate | null;
+  }
+) {
+  const topology = buildRoadTopology(elements, options.highwayPattern);
+  if (!topology.roadWays.length) {
+    return null;
+  }
+
+  const candidates = topology.roadWays
+    .map((way) => {
+      const point = getOverpassPoint(way, topology.nodeElements);
+      if (!point) {
+        return null;
+      }
+
+      return options.buildCandidate(way, topology, point);
+    })
+    .filter((candidate): candidate is ScoredFeatureCandidate => Boolean(candidate));
+
+  return selectBestFeatureCandidate(candidates, startPoint, existingStops);
+}
+
+function findVerifiedSignalizedIntersectionMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[],
+  options: {
+    requireLeftTurnLane: boolean;
+    preferBusyIntersection: boolean;
+    requireSpecificLeftTurnPath?: boolean;
+  }
+) {
+  const topology = buildRoadTopology(elements, majorRoadPattern);
+  const signalNodes = elements.filter(
+    (element): element is OverpassElement & { type: "node"; lat: number; lon: number } =>
+      element.type === "node" &&
+      typeof element.lat === "number" &&
+      typeof element.lon === "number" &&
+      element.tags?.highway === "traffic_signals" &&
+      element.tags?.traffic_signals !== "pedestrian_crossing"
+  );
+
+  const candidates = signalNodes
+    .map((signalNode) => {
+      const connectedWays = getConnectedWays(topology, signalNode.id);
+      if (connectedWays.length < 2) {
+        return null;
+      }
+
+      const roadNames = [
+        ...new Set(
+          connectedWays
+            .map((way) => getWayName(way))
+            .filter((name): name is string => Boolean(name))
+        )
+      ];
+      if (roadNames.length < 2) {
+        return null;
+      }
+
+      const totalLanes = Math.max(...connectedWays.map((way) => getTotalLaneCount(way.tags) ?? 0));
+      const leftTurnLanes = Math.max(...connectedWays.map((way) => countLeftTurnLanes(way.tags)));
+      const majorRoadCount = connectedWays.filter((way) =>
+        Boolean(way.tags?.highway && /^(trunk|primary|secondary)$/.test(way.tags.highway))
+      ).length;
+      const hasProtectedLeftSignals =
+        hasProtectedLeftSignalMetadata(signalNode.tags) ||
+        connectedWays.some((way) => hasProtectedLeftSignalMetadata(way.tags));
+
+      if (options.requireLeftTurnLane && leftTurnLanes === 0) {
+        return null;
+      }
+
+      if (options.preferBusyIntersection && totalLanes < 4 && majorRoadCount === 0) {
+        return null;
+      }
+
+      if (options.requireSpecificLeftTurnPath) {
+        if (hasProtectedLeftSignals) {
+          return null;
+        }
+
+        const leftTurnCandidate = findUnprotectedLeftTurnCandidate(signalNode, connectedWays, topology);
+
+        if (!leftTurnCandidate) {
+          return null;
+        }
+
+        return {
+          ...leftTurnCandidate,
+          score: leftTurnCandidate.score + totalLanes + majorRoadCount * 3 + roadNames.length
+        };
+      }
+
+      return {
+        point: {
+          latitude: signalNode.lat,
+          longitude: signalNode.lon
+        },
+        addressHint: buildIntersectionLabel(roadNames) ?? undefined,
+        verificationStatus: "verified" as const,
+        score:
+          leftTurnLanes * 8 +
+          totalLanes * 2 +
+          majorRoadCount * 4 +
+          roadNames.length
+      };
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
+
+  return selectBestFeatureCandidate(candidates, startPoint, existingStops);
+}
+
+function findVerifiedRampMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[],
+  options: {
+    connectorMode: boolean;
+  }
+) {
+  const topology = buildRoadTopology(elements, /^(motorway|trunk|motorway_link|trunk_link|primary|secondary|tertiary|unclassified|residential|living_street)$/);
+  const rampWays = topology.roadWays.filter((way) =>
+    Boolean(way.tags?.highway && rampRoadPattern.test(way.tags.highway))
+  );
+
+  const candidates = rampWays
+    .map((way) => {
+      const point = getOverpassPoint(way, topology.nodeElements);
+      if (!point) {
+        return null;
+      }
+
+      const endpointNodeIds = [way.nodes[0], way.nodes[way.nodes.length - 1]].filter(
+        (nodeId): nodeId is number => typeof nodeId === "number"
+      );
+      const endpointConnections = endpointNodeIds.map((nodeId) => getConnectedWays(topology, nodeId, way.id));
+      const connectedWays = endpointConnections.flat();
+      const surfaceConnections = connectedWays.filter((connectedWay) =>
+        Boolean(
+          connectedWay.tags?.highway &&
+            surfaceRoadPattern.test(connectedWay.tags.highway) &&
+            !highSpeedRoadPattern.test(connectedWay.tags.highway)
+        )
+      );
+      const highSpeedConnections = connectedWays.filter((connectedWay) =>
+        Boolean(connectedWay.tags?.highway && highSpeedRoadPattern.test(connectedWay.tags.highway))
+      );
+      const highSpeedEndpoints = endpointConnections.filter((connectedSet) =>
+        connectedSet.some(
+          (connectedWay) =>
+            Boolean(connectedWay.tags?.highway && highSpeedRoadPattern.test(connectedWay.tags.highway))
+        )
+      ).length;
+
+      if (options.connectorMode) {
+        if (!highSpeedConnections.length || highSpeedEndpoints < 1) {
+          return null;
+        }
+      } else if (!highSpeedConnections.length || !surfaceConnections.length) {
+        return null;
+      }
+
+      const surfaceRoadName = surfaceConnections.map((connectedWay) => getWayName(connectedWay)).find(Boolean);
+      const highSpeedRoadName = highSpeedConnections.map((connectedWay) => getWayName(connectedWay)).find(Boolean);
+      const addressHint = options.connectorMode
+        ? [getWayName(way), highSpeedRoadName].filter(Boolean).join(" near ") || getWayName(way) || undefined
+        : surfaceRoadName && highSpeedRoadName
+          ? `${surfaceRoadName} ramp toward ${highSpeedRoadName}`
+          : getWayName(way) ?? highSpeedRoadName ?? undefined;
+
+      return {
+        point,
+        addressHint,
+        verificationStatus: "verified" as const,
+        score:
+          highSpeedConnections.length * 6 +
+          highSpeedEndpoints * 4 +
+          surfaceConnections.length * (options.connectorMode ? 1 : 4) +
+          (getWayName(way) ? 2 : 0)
+      };
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
+
+  return selectBestFeatureCandidate(candidates, startPoint, existingStops);
+}
+
+function findVerifiedFourWayStopMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+): FeatureMatch | null {
+  const rankedJunctions = rankFourWayStopJunctions(elements, startPoint, existingStops);
+  const bestMatch = rankedJunctions.find(
+    (junction) => junction.explicitAllWayStop || junction.controlledApproachCount >= 4
+  );
+
+  if (!bestMatch) {
+    return null;
+  }
+
+  return {
+    point: bestMatch.point,
+    addressHint: bestMatch.addressHint ?? undefined,
+    verificationStatus: "verified"
+  };
+}
+
+function rankFourWayStopJunctions(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  const topology = buildRoadTopology(elements, fourWayStopRoadPattern);
+  if (!topology.roadWays.length) {
+    return [];
+  }
+
+  const junctions = new Map<
+    number,
+    {
+      point: Pick<GeocodeResult, "latitude" | "longitude">;
+      roadNames: Set<string>;
+      branchNodeIds: Set<number>;
+      controlledApproachIds: Set<number>;
+      explicitAllWayStop: boolean;
+      connectedHighwayTypes: Set<string>;
+    }
+  >();
+
+  for (const [nodeId, connectedWayIds] of topology.wayIdsByNode.entries()) {
+    if (connectedWayIds.size < 2) {
+      continue;
+    }
+
+    const nodeElement = topology.nodeElements.get(nodeId);
+    if (!nodeElement || nodeElement.tags?.highway === "traffic_signals") {
+      continue;
+    }
+
+    const point = getOverpassPoint(nodeElement);
+    if (!point) {
+      continue;
+    }
+
+    const roadNames = new Set<string>();
+    const branchNodeIds = new Set<number>();
+    const connectedHighwayTypes = new Set<string>();
+
+    for (const wayId of connectedWayIds) {
+      const way = topology.waysById.get(wayId);
+      if (!way) {
+        continue;
+      }
+
+      if (way.tags?.highway) {
+        connectedHighwayTypes.add(way.tags.highway);
+      }
+
+      if (way.tags?.name?.trim()) {
+        roadNames.add(way.tags.name.trim());
+      }
+
+      for (let index = 0; index < way.nodes.length; index += 1) {
+        if (way.nodes[index] !== nodeId) {
+          continue;
+        }
+
+        if (index > 0) {
+          branchNodeIds.add(way.nodes[index - 1]);
+        }
+
+        if (index < way.nodes.length - 1) {
+          branchNodeIds.add(way.nodes[index + 1]);
+        }
+      }
+    }
+
+    if (branchNodeIds.size < 4) {
+      continue;
+    }
+
+    junctions.set(nodeId, {
+      point,
+      roadNames,
+      branchNodeIds,
+      controlledApproachIds: new Set<number>(),
+      explicitAllWayStop:
+        nodeElement.tags?.stop === "all" || nodeElement.tags?.highway === "stop",
+      connectedHighwayTypes
+    });
+  }
+
+  if (!junctions.size) {
+    return [];
+  }
+
+  const stopNodes = elements.filter(isStopControlNode);
+
+  for (const stopNode of stopNodes) {
+    const containingWayIds = topology.wayIdsByNode.get(stopNode.id);
+    if (!containingWayIds?.size) {
+      continue;
+    }
+
+    const stopPoint = {
+      latitude: stopNode.lat,
+      longitude: stopNode.lon
+    };
+
+    let bestMatch:
+      | {
+          junctionId: number;
+          branchNodeId: number;
+          distanceFromJunction: number;
+        }
+      | null = null;
+
+    for (const wayId of containingWayIds) {
+      const way = topology.waysById.get(wayId);
+      if (!way) {
+        continue;
+      }
+
+      const stopIndex = way.nodes.indexOf(stopNode.id);
+      if (stopIndex === -1) {
+        continue;
+      }
+
+      for (let junctionIndex = 0; junctionIndex < way.nodes.length; junctionIndex += 1) {
+        const junctionId = way.nodes[junctionIndex];
+        const junction = junctions.get(junctionId);
+        if (!junction || junctionIndex === stopIndex) {
+          continue;
+        }
+
+        const distanceFromJunction = distanceKm(stopPoint, junction.point);
+        if (distanceFromJunction > maxFourWayStopLineDistanceKm) {
+          continue;
+        }
+
+        const branchNodeId =
+          stopIndex > junctionIndex ? way.nodes[junctionIndex + 1] : way.nodes[junctionIndex - 1];
+        if (!branchNodeId || !junction.branchNodeIds.has(branchNodeId)) {
+          continue;
+        }
+
+        if (!bestMatch || distanceFromJunction < bestMatch.distanceFromJunction) {
+          bestMatch = {
+            junctionId,
+            branchNodeId,
+            distanceFromJunction
+          };
+        }
+      }
+    }
+
+    if (bestMatch) {
+      const matchedJunction = junctions.get(bestMatch.junctionId);
+      matchedJunction?.controlledApproachIds.add(bestMatch.branchNodeId);
+
+      if (stopNode.tags?.stop === "all") {
+        matchedJunction!.explicitAllWayStop = true;
+      }
+    }
+  }
+
+  return [...junctions.values()]
+    .map((junction) => {
+      const distanceFromStart = distanceKm(startPoint, junction.point);
+      const distanceFromExisting = existingStops.length
+        ? Math.min(
+            ...existingStops.map((segment) =>
+              distanceKm(
+                { latitude: segment.latitude, longitude: segment.longitude },
+                junction.point
+              )
+            )
+          )
+        : Number.POSITIVE_INFINITY;
+
+      return {
+        ...junction,
+        distanceFromStart,
+        distanceFromExisting,
+        addressHint: buildIntersectionLabel([...junction.roadNames]),
+        controlledApproachCount: junction.controlledApproachIds.size,
+        localRoadOnly: [...junction.connectedHighwayTypes].every((highway) =>
+          isLocalIntersectionRoadType(highway)
+        )
+      };
+    })
+    .filter((junction) => junction.distanceFromExisting > 0.2)
+    .sort(
+      (a, b) =>
+        Number(b.explicitAllWayStop) - Number(a.explicitAllWayStop) ||
+        b.controlledApproachCount - a.controlledApproachCount ||
+        Number(b.localRoadOnly) - Number(a.localRoadOnly) ||
+        a.distanceFromStart - b.distanceFromStart
+    );
+}
+
+function findVerifiedResidentialStopMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  const stopNodePoints = elements
+    .filter(
+      (element): element is OverpassElement & { type: "node"; lat: number; lon: number } =>
+        element.type === "node" &&
+        typeof element.lat === "number" &&
+        typeof element.lon === "number" &&
+        (element.tags?.highway === "stop" || element.tags?.traffic_sign === "stop")
+    )
+    .map((element) => ({
+      latitude: element.lat,
+      longitude: element.lon
+    }));
+
+  return findVerifiedRoadSegmentMatch(elements, startPoint, existingStops, {
+    highwayPattern: residentialRoadPattern,
+    buildCandidate: (way, _topology, point) => {
+      const nearbyStopCount = stopNodePoints.filter((stopPoint) => distanceKm(stopPoint, point) < 0.12).length;
+      if (!nearbyStopCount) {
+        return null;
+      }
+
+      return {
+        point,
+        addressHint: buildRoadAddressHint(way),
+        verificationStatus: "verified",
+        score: nearbyStopCount * 6 + (getWayName(way) ? 2 : 0) + (parseMaxSpeed(way.tags) ? 2 : 0)
+      };
+    }
+  });
+}
+
+function findVerifiedArterialMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  return findVerifiedRoadSegmentMatch(elements, startPoint, existingStops, {
+    highwayPattern: arterialRoadPattern,
+    buildCandidate: (way, _topology, point) => {
+      const laneCount = getTotalLaneCount(way.tags) ?? 0;
+      const maxSpeed = parseMaxSpeed(way.tags) ?? 0;
+      const highway = way.tags?.highway ?? "";
+
+      if (!getWayName(way)) {
+        return null;
+      }
+
+      if (laneCount < 2 && maxSpeed < 25 && highway === "tertiary") {
+        return null;
+      }
+
+      return {
+        point,
+        addressHint: buildRoadAddressHint(way),
+        verificationStatus: "verified",
+        score:
+          (highway === "primary" ? 8 : highway === "secondary" ? 6 : 4) +
+          laneCount * 2 +
+          Math.floor(maxSpeed / 10)
+      };
+    }
+  });
+}
+
+function findVerifiedMultiLaneArterialMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  return findVerifiedRoadSegmentMatch(elements, startPoint, existingStops, {
+    highwayPattern: arterialRoadPattern,
+    buildCandidate: (way, _topology, point) => {
+      const totalLanes = getTotalLaneCount(way.tags) ?? 0;
+      const directionalLanes = getMaxDirectionalLaneCount(way.tags);
+      const highway = way.tags?.highway ?? "";
+
+      if (!getWayName(way) || (totalLanes < 4 && directionalLanes < 2)) {
+        return null;
+      }
+
+      return {
+        point,
+        addressHint: buildRoadAddressHint(way),
+        verificationStatus: "verified",
+        score:
+          totalLanes * 3 +
+          directionalLanes * 4 +
+          (highway === "primary" ? 6 : highway === "secondary" ? 4 : 2)
+      };
+    }
+  });
+}
+
+function findVerifiedBoulevardMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  return findVerifiedRoadSegmentMatch(elements, startPoint, existingStops, {
+    highwayPattern: arterialRoadPattern,
+    buildCandidate: (way, _topology, point) => {
+      const totalLanes = getTotalLaneCount(way.tags) ?? 0;
+      const maxSpeed = parseMaxSpeed(way.tags) ?? 0;
+      const highway = way.tags?.highway ?? "";
+
+      if (!getWayName(way)) {
+        return null;
+      }
+
+      if (totalLanes < 3 && maxSpeed < 25 && highway === "tertiary") {
+        return null;
+      }
+
+      return {
+        point,
+        addressHint: buildRoadAddressHint(way),
+        verificationStatus: "verified",
+        score:
+          (highway === "primary" ? 7 : highway === "secondary" ? 5 : 3) +
+          totalLanes * 2 +
+          Math.floor(maxSpeed / 10)
+      };
+    }
+  });
+}
+
+function findVerifiedLitRoadMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  return findVerifiedRoadSegmentMatch(elements, startPoint, existingStops, {
+    highwayPattern: arterialRoadPattern,
+    buildCandidate: (way, _topology, point) => {
+      if (!getWayName(way) || !hasLitTag(way.tags)) {
+        return null;
+      }
+
+      return {
+        point,
+        addressHint: buildRoadAddressHint(way),
+        verificationStatus: "verified",
+        score:
+          (way.tags?.highway === "primary" ? 7 : way.tags?.highway === "secondary" ? 5 : 3) +
+          (getTotalLaneCount(way.tags) ?? 0) * 2 +
+          Math.floor((parseMaxSpeed(way.tags) ?? 0) / 10)
+      };
+    }
+  });
+}
+
+function findVerifiedCurbsideMatch(
+  elements: OverpassElement[],
+  startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
+  existingStops: RouteStop[]
+) {
+  return findVerifiedRoadSegmentMatch(elements, startPoint, existingStops, {
+    highwayPattern: residentialRoadPattern,
+    buildCandidate: (way, _topology, point) => {
+      if (!getWayName(way) || !hasPositiveParkingTag(way.tags)) {
+        return null;
+      }
+
+      const maxSpeed = parseMaxSpeed(way.tags) ?? 0;
+
+      return {
+        point,
+        addressHint: buildRoadAddressHint(way),
+        verificationStatus: "verified",
+        score: 8 + (maxSpeed > 0 && maxSpeed <= 25 ? 2 : 0)
+      };
+    }
+  });
+}
+
+function buildRoadNetworkQuery(
+  latitude: number,
+  longitude: number,
+  radiusMeters: number,
+  roadPattern: string,
+  extraStatements: string[] = []
+) {
+  return `
+[out:json][timeout:20];
+way(around:${radiusMeters},${latitude},${longitude})[highway~"${roadPattern}"]->.roads;
+node(w.roads)->.roadNodes;
+(
+  .roads;
+  .roadNodes;
+  ${extraStatements.join("\n  ")}
+);
+out body;`;
 }
 
 function buildOverpassQuery(
@@ -500,99 +1844,97 @@ function buildOverpassQuery(
   const lon = startPoint.longitude;
 
   if (skillId === "four-way-stop") {
-    return `
-[out:json][timeout:20];
-(
-  node(around:${radiusMeters},${lat},${lon})[highway=stop];
-);
-out 40;`;
+    return buildRoadNetworkQuery(
+      lat,
+      lon,
+      radiusMeters,
+      "primary|secondary|tertiary|unclassified|residential|living_street",
+      [
+        `node(w.roads)[highway=stop];`,
+        `node(w.roads)[traffic_sign=stop];`
+      ]
+    );
   }
 
   switch (tag) {
     case "highway-on-ramp":
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway~"motorway_link|trunk_link"];
-  node(around:${radiusMeters},${lat},${lon})[highway=motorway_junction];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(
+        lat,
+        lon,
+        radiusMeters,
+        "motorway|trunk|motorway_link|trunk_link|primary|secondary|tertiary|unclassified|residential|living_street",
+        [`node(around:${radiusMeters},${lat},${lon})[highway=motorway_junction];`]
+      );
     case "freeway-connector":
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway~"motorway|trunk|motorway_link|trunk_link"];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(
+        lat,
+        lon,
+        radiusMeters,
+        "motorway|trunk|motorway_link|trunk_link|primary|secondary|tertiary|unclassified|residential|living_street",
+        [`node(around:${radiusMeters},${lat},${lon})[highway=motorway_junction];`]
+      );
     case "busy-intersection":
     case "signalized-left":
-      return `
-[out:json][timeout:20];
-(
-  node(around:${radiusMeters},${lat},${lon})[highway=traffic_signals];
-);
-out 12;`;
+      return buildRoadNetworkQuery(
+        lat,
+        lon,
+        radiusMeters,
+        "trunk|primary|secondary|tertiary",
+        [`node(around:${radiusMeters},${lat},${lon})[highway=traffic_signals];`]
+      );
     case "multi-lane-arterial":
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway~"primary|secondary"][lanes];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(
+        lat,
+        lon,
+        radiusMeters,
+        "primary|secondary|tertiary"
+      );
     case "arterial":
     case "boulevard":
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway~"primary|secondary|tertiary"];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(lat, lon, radiusMeters, "primary|secondary|tertiary");
     case "residential-grid":
+      return buildRoadNetworkQuery(
+        lat,
+        lon,
+        radiusMeters,
+        "residential|living_street|unclassified",
+        [`node(around:${radiusMeters},${lat},${lon})[highway=stop];`]
+      );
     case "curbside":
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway~"residential|living_street|unclassified"];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(lat, lon, radiusMeters, "residential|living_street|unclassified");
     case "well-lit-loop":
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway~"primary|secondary"][lit=yes];
-  way(around:${radiusMeters},${lat},${lon})[highway~"primary|secondary|tertiary"];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(lat, lon, radiusMeters, "primary|secondary|tertiary");
     default:
-      return `
-[out:json][timeout:20];
-(
-  way(around:${radiusMeters},${lat},${lon})[highway];
-);
-out center 12;`;
+      return buildRoadNetworkQuery(
+        lat,
+        lon,
+        radiusMeters,
+        "motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street"
+      );
   }
 }
 
 async function findNearbyFeatureForTag(
   skillId: string | undefined,
   tag: string,
+  searchPoint: Pick<GeocodeResult, "latitude" | "longitude">,
   startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
-  existingStops: RouteStop[],
-  options?: {
-    allowApproximate?: boolean;
-  }
-) {
-  const allowApproximate = Boolean(options?.allowApproximate);
+  existingStops: RouteStop[]
+): Promise<FeatureMatch | null> {
   const radiusCandidates = skillId === "four-way-stop"
     ? [1800, 3200, 5500, 8000]
     : tag === "highway-on-ramp" || tag === "freeway-connector"
       ? [6000, 12000, 20000, 32000]
-      : strictFeatureTags.has(tag)
+      : tag === "busy-intersection" || tag === "signalized-left"
         ? [5000, 9000, 15000]
+        : tag === "multi-lane-arterial" || tag === "boulevard" || tag === "arterial" || tag === "well-lit-loop"
+          ? [3500, 6500, 10000]
+          : tag === "residential-grid" || tag === "curbside"
+            ? [2500, 5000, 8000]
         : [2500, 5000];
 
   for (const radiusMeters of radiusCandidates) {
-    const query = buildOverpassQuery(startPoint, skillId, tag, radiusMeters);
+    const query = buildOverpassQuery(searchPoint, skillId, tag, radiusMeters);
     const response = await fetch("https://overpass-api.de/api/interpreter", {
       method: "POST",
       headers: {
@@ -611,59 +1953,66 @@ async function findNearbyFeatureForTag(
 
     const data = (await response.json()) as OverpassResponse;
     const elements = Array.isArray(data.elements) ? data.elements : [];
-    const stopNodes = skillId === "four-way-stop"
-      ? elements
-          .map((element) => getOverpassPoint(element))
-          .filter((point): point is NonNullable<typeof point> => Boolean(point))
-      : [];
-    const rankedPoints = elements
-      .map((element) => {
-        const point = getOverpassPoint(element);
-        if (!point) {
-          return null;
-        }
+    if (skillId === "four-way-stop") {
+      const verifiedFourWayStop = findVerifiedFourWayStopMatch(elements, startPoint, existingStops);
+      if (verifiedFourWayStop) {
+        return verifiedFourWayStop;
+      }
 
-        const distanceFromStart = distanceKm(startPoint, point);
-        const distanceFromExisting = existingStops.length
-          ? Math.min(
-              ...existingStops.map((segment) =>
-                distanceKm(
-                  { latitude: segment.latitude, longitude: segment.longitude },
-                  point
-                )
-              )
-            )
-          : Number.POSITIVE_INFINITY;
-        const nearbyStopCount =
-          skillId === "four-way-stop"
-            ? stopNodes.filter((candidate) => distanceKm(candidate, point) < 0.06).length
-            : 0;
+      continue;
+    }
 
-        return {
-          point,
-          distanceFromStart,
-          distanceFromExisting,
-          nearbyStopCount,
-          hasAllWayStopTag: element.tags?.stop === "all"
-        };
-      })
-      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
-      .filter((entry) => entry.distanceFromExisting > 0.2)
-      .filter((entry) =>
-        skillId === "four-way-stop"
-          ? entry.hasAllWayStopTag || entry.nearbyStopCount >= (allowApproximate ? 2 : 3)
-          : true
-      )
-      .sort((a, b) =>
-        skillId === "four-way-stop"
-          ? Number(b.hasAllWayStopTag) - Number(a.hasAllWayStopTag) ||
-            b.nearbyStopCount - a.nearbyStopCount ||
-            a.distanceFromStart - b.distanceFromStart
-          : a.distanceFromStart - b.distanceFromStart
-      );
+    let verifiedMatch: FeatureMatch | null = null;
+    switch (tag) {
+      case "highway-on-ramp":
+        verifiedMatch = findVerifiedRampMatch(elements, startPoint, existingStops, {
+          connectorMode: false
+        });
+        break;
+      case "freeway-connector":
+        verifiedMatch = findVerifiedRampMatch(elements, startPoint, existingStops, {
+          connectorMode: true
+        });
+        break;
+      case "busy-intersection":
+        verifiedMatch = findVerifiedSignalizedIntersectionMatch(elements, startPoint, existingStops, {
+          requireLeftTurnLane: true,
+          preferBusyIntersection: true,
+          requireSpecificLeftTurnPath: false
+        });
+        break;
+      case "signalized-left":
+        verifiedMatch = findVerifiedSignalizedIntersectionMatch(elements, startPoint, existingStops, {
+          requireLeftTurnLane: true,
+          preferBusyIntersection: false,
+          requireSpecificLeftTurnPath: true
+        });
+        break;
+      case "multi-lane-arterial":
+        verifiedMatch = findVerifiedMultiLaneArterialMatch(elements, startPoint, existingStops);
+        break;
+      case "boulevard":
+        verifiedMatch = findVerifiedBoulevardMatch(elements, startPoint, existingStops);
+        break;
+      case "arterial":
+        verifiedMatch = findVerifiedArterialMatch(elements, startPoint, existingStops);
+        break;
+      case "residential-grid":
+        verifiedMatch = findVerifiedResidentialStopMatch(elements, startPoint, existingStops);
+        break;
+      case "curbside":
+        verifiedMatch = findVerifiedCurbsideMatch(elements, startPoint, existingStops);
+        break;
+      case "well-lit-loop":
+        verifiedMatch = findVerifiedLitRoadMatch(elements, startPoint, existingStops);
+        break;
+      default:
+        verifiedMatch = null;
+        break;
+    }
 
-    if (rankedPoints[0]) {
-      return rankedPoints[0].point;
+    if (verifiedMatch) {
+      return verifiedMatch;
     }
   }
 
@@ -672,20 +2021,26 @@ async function findNearbyFeatureForTag(
 
 async function findNearbyFeatureForTarget(
   target: SkillTarget,
+  searchPoints: Array<Pick<GeocodeResult, "latitude" | "longitude">>,
   startPoint: Pick<GeocodeResult, "latitude" | "longitude">,
-  existingStops: RouteStop[],
-  options?: {
-    allowApproximate?: boolean;
-  }
+  existingStops: RouteStop[]
 ) {
-  for (const tag of target.tags) {
-    const point = await findNearbyFeatureForTag(target.skillId, tag, startPoint, existingStops, options);
-
-    if (point) {
-      return {
+  for (const searchPoint of searchPoints) {
+    for (const tag of target.tags) {
+      const feature = await findNearbyFeatureForTag(
+        target.skillId,
         tag,
-        point
-      };
+        searchPoint,
+        startPoint,
+        existingStops
+      );
+
+      if (feature) {
+        return {
+          tag,
+          feature
+        };
+      }
     }
   }
 
@@ -747,12 +2102,20 @@ async function reverseGeocodePoint(point: Pick<GeocodeResult, "latitude" | "long
   return data.display_name ?? null;
 }
 
-async function normalizeStopPoint(result: GeocodeResult) {
+async function normalizeStopPoint(
+  result: GeocodeResult,
+  options?: {
+    preferredAddress?: string;
+  }
+) {
   const snapped = (await snapToNearestRoad(result)) ?? {
     latitude: result.latitude,
     longitude: result.longitude
   };
-  const address = (await reverseGeocodePoint(snapped)) ?? result.address;
+  const address =
+    options?.preferredAddress ??
+    (await reverseGeocodePoint(snapped)) ??
+    result.address;
 
   return {
     latitude: snapped.latitude,
@@ -761,82 +2124,84 @@ async function normalizeStopPoint(result: GeocodeResult) {
   } satisfies GeocodeResult;
 }
 
-function hashString(value: string) {
-  let hash = 0;
+function dedupeSearchPoints(points: Array<Pick<GeocodeResult, "latitude" | "longitude">>) {
+  return points.filter(
+    (point, pointIndex, collection) =>
+      collection.findIndex(
+        (candidatePoint) =>
+          Math.abs(candidatePoint.latitude - point.latitude) < 0.0001 &&
+          Math.abs(candidatePoint.longitude - point.longitude) < 0.0001
+      ) === pointIndex
+  );
+}
 
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+async function resolveCandidateSearchAnchors(
+  candidate: SuggestedStop,
+  startPoint: GeocodeResult
+) {
+  const resolvedAnchors: GeocodeResult[] = [];
+  const searchQueries = normalizeQueryList([candidate.searchQuery, ...(candidate.alternateQueries ?? [])]).slice(0, 5);
+
+  for (const searchQuery of searchQueries) {
+    const geocoded = await geocodeQuery(searchQuery, startPoint);
+    if (!geocoded || distanceKm(startPoint, geocoded) > 40) {
+      continue;
+    }
+
+    const alreadyIncluded = resolvedAnchors.some(
+      (anchor) =>
+        Math.abs(anchor.latitude - geocoded.latitude) < 0.0001 &&
+        Math.abs(anchor.longitude - geocoded.longitude) < 0.0001
+    );
+    if (!alreadyIncluded) {
+      resolvedAnchors.push(geocoded);
+    }
   }
 
-  return hash;
+  return resolvedAnchors;
 }
 
-function moveCoordinate(
-  origin: Pick<GeocodeResult, "latitude" | "longitude">,
-  distanceKm: number,
-  bearingDegrees: number
-) {
-  const earthRadiusKm = 6371;
-  const angularDistance = distanceKm / earthRadiusKm;
-  const bearingRadians = (bearingDegrees * Math.PI) / 180;
-  const startLatitude = (origin.latitude * Math.PI) / 180;
-  const startLongitude = (origin.longitude * Math.PI) / 180;
-
-  const latitude = Math.asin(
-    Math.sin(startLatitude) * Math.cos(angularDistance) +
-      Math.cos(startLatitude) * Math.sin(angularDistance) * Math.cos(bearingRadians)
-  );
-
-  const longitude =
-    startLongitude +
-    Math.atan2(
-      Math.sin(bearingRadians) * Math.sin(angularDistance) * Math.cos(startLatitude),
-      Math.cos(angularDistance) - Math.sin(startLatitude) * Math.sin(latitude)
-    );
-
-  return {
-    latitude: (latitude * 180) / Math.PI,
-    longitude: (longitude * 180) / Math.PI
-  };
-}
-
-function buildFallbackSegmentsNearStart(
+async function findVerifiedFeatureForCandidate(
+  target: SkillTarget,
+  candidate: SuggestedStop,
   startPoint: GeocodeResult,
-  skillTargets: SkillTarget[],
-  startLocation: string,
-  tagFocusMap: Record<string, string[]>
-): RawFallbackStop[] {
-  const seed = hashString(
-    `${startLocation}:${startPoint.latitude.toFixed(5)}:${startPoint.longitude.toFixed(5)}`
-  );
+  existingStops: RouteStop[]
+) {
+  const searchAnchors = await resolveCandidateSearchAnchors(candidate, startPoint);
+  const searchPoints = dedupeSearchPoints([...searchAnchors, startPoint]);
+  const prioritizedTarget: SkillTarget = {
+    ...target,
+    primaryTag: candidate.tag,
+    tags: [candidate.tag, ...target.tags.filter((tag) => tag !== candidate.tag)]
+  };
 
-  return skillTargets.map((target, index) => {
-    const tag = target.primaryTag;
-    const descriptor = stopDescriptors[tag] ?? {
-      title: "Practice stop",
-      searchHint: "public road",
-      reason: "Selected to reinforce the current priority skill mix."
-    };
-    const tagSeed = hashString(`${tag}:${seed}:${index}`);
-    const bearing = (tagSeed % 360 + index * 67) % 360;
-    const distanceKm = 0.45 + ((tagSeed % 6) * 0.18 + index * 0.12);
-    const coordinate = moveCoordinate(startPoint, distanceKm, bearing);
-    const focusLabels = tagFocusMap[tag] ?? [];
+  return findNearbyFeatureForTarget(prioritizedTarget, searchPoints, startPoint, existingStops);
+}
 
-    return {
-      skillId: target.skillId,
-      skillLabel: target.skillLabel,
-      tag,
-      title: buildFallbackTitle(tag, focusLabels),
-      address: `Approximate road segment about ${distanceKm.toFixed(1)} km from ${startLocation}`,
-      reason: focusLabels.length
-        ? `Approximate fallback for ${focusLabels.join(" and ")} near your selected start point.`
-        : "Generated as a nearby fallback around your selected start point. Confirm this stop matches the intended maneuver before driving it.",
-      etaMinutes: 5 + index * 6,
-      latitude: coordinate.latitude,
-      longitude: coordinate.longitude
-    };
-  });
+function mergeSkillIntoSegment(segment: RouteStop, focusLabels: string[]) {
+  const existingLabels = segment.focusSkillLabels ?? [];
+  const newLabels = focusLabels.filter((label) => !existingLabels.includes(label));
+  if (!newLabels.length) {
+    return;
+  }
+
+  segment.focusSkillLabels = [...existingLabels, ...newLabels];
+  if (!segment.reason.toLowerCase().includes("also reinforces")) {
+    segment.reason = `${segment.reason} Also reinforces ${formatSkillLabelList(newLabels).toLowerCase()}.`;
+  }
+}
+
+function buildVerifiedFailureMessage(request: RouteRequest, target: SkillTarget) {
+  const tailoredSuggestion =
+    target.skillId === "highway-merge"
+      ? "Try a start point closer to a known freeway entrance or arterial that feeds an on-ramp."
+      : target.skillId === "unprotected-left"
+        ? "Try a start point closer to a signalized commercial corridor with dedicated turn lanes."
+        : target.skillId === "four-way-stop"
+          ? "Try a quieter neighborhood intersection with clearly mapped stop-sign control."
+          : "Try a more specific start point or nearby intersection.";
+
+  return `RoadReady's AI planner could not map-verify a ${target.skillLabel.toLowerCase()} segment near ${request.startLocation}. ${tailoredSuggestion}`;
 }
 
 function formatRoadName(name: string) {
@@ -989,7 +2354,7 @@ export async function generateSmartRoutePlan(
       : parseCoordinateLocation(request.startLocation);
   const startPoint = explicitStartPoint ?? (await geocodeQuery(request.startLocation));
   if (!startPoint) {
-    return generateRoutePlan(skills, recommendations, request);
+    throw new RouteGenerationError("RoadReady could not locate that starting point precisely. Try a more specific address or intersection.");
   }
 
   const tags = canonicalizeTags(skills, request);
@@ -998,57 +2363,39 @@ export async function generateSmartRoutePlan(
   const aiStops = await suggestStopsWithOpenAI(request, recommendations, tags);
   const candidates = buildCandidateStopsForSkills(request.startLocation, skillTargets, aiStops);
   const segments: RouteStop[] = [];
-  const warnings = new Set<string>();
+  let usedAIPlanning = candidates.some((candidate) => candidate.source === "ai");
 
   for (const [index, target] of skillTargets.entries()) {
-    const candidate = candidates[index];
-    const featureMatch = await findNearbyFeatureForTarget(target, startPoint, segments);
-    const resolvedTag = featureMatch?.tag ?? candidate.tag ?? target.primaryTag;
-    const requiresVerifiedFeature = isStrictSkillTarget(target);
-    const focusLabels = candidate.skillLabel ? [candidate.skillLabel] : tagFocusMap[resolvedTag] ?? [];
-    const resolved =
-      featureMatch
-        ? {
-            latitude: featureMatch.point.latitude,
-            longitude: featureMatch.point.longitude,
-            address: candidate.searchQuery
-          }
-        : requiresVerifiedFeature
-          ? null
-          : await geocodeQuery(candidate.searchQuery, startPoint);
-    if (!resolved) {
-      if (requiresVerifiedFeature) {
-        const approximateFeatureMatch = await findNearbyFeatureForTarget(target, startPoint, segments, {
-          allowApproximate: true
-        });
-
-        if (approximateFeatureMatch) {
-          const normalizedApproximateStop = await normalizeStopPoint({
-            latitude: approximateFeatureMatch.point.latitude,
-            longitude: approximateFeatureMatch.point.longitude,
-            address: candidate.searchQuery
-          });
-
-          segments.push({
-            id: `${target.skillId}-${segments.length}`,
-            tag: approximateFeatureMatch.tag,
-            title: buildFallbackTitle(approximateFeatureMatch.tag, focusLabels),
-            address: normalizedApproximateStop.address,
-            reason: `${candidate.reason} Nearby map data suggests this is an approximate match, so confirm the maneuver before driving it.`,
-            focusSkillLabels: focusLabels,
-            etaMinutes: 5 + segments.length * 6,
-            latitude: normalizedApproximateStop.latitude,
-            longitude: normalizedApproximateStop.longitude,
-            source: "fallback",
-            verificationStatus: "approximate"
-          });
-        }
+    let activeCandidate = candidates[index];
+    let featureMatch = await findVerifiedFeatureForCandidate(target, activeCandidate, startPoint, segments);
+    if (!featureMatch) {
+      const aiRetryCandidates = await suggestStopRetriesWithOpenAI(request, target, activeCandidate);
+      if (aiRetryCandidates?.length) {
+        usedAIPlanning = true;
       }
 
-      continue;
+      for (const retryCandidate of aiRetryCandidates ?? []) {
+        activeCandidate = retryCandidate;
+        featureMatch = await findVerifiedFeatureForCandidate(target, activeCandidate, startPoint, segments);
+        if (featureMatch) {
+          break;
+        }
+      }
     }
 
-    const tooCloseToExisting = segments.some(
+    const resolvedTag = featureMatch?.tag ?? activeCandidate.tag ?? target.primaryTag;
+    const focusLabels = activeCandidate.skillLabel ? [activeCandidate.skillLabel] : tagFocusMap[resolvedTag] ?? [];
+    if (!featureMatch) {
+      throw new RouteGenerationError(buildVerifiedFailureMessage(request, target));
+    }
+
+    const resolved = {
+      latitude: featureMatch.feature.point.latitude,
+      longitude: featureMatch.feature.point.longitude,
+      address: featureMatch.feature.addressHint ?? activeCandidate.searchQuery
+    };
+
+    const nearbyExistingSegment = segments.find(
       (segment) =>
         distanceKm(
           { latitude: segment.latitude, longitude: segment.longitude },
@@ -1056,93 +2403,40 @@ export async function generateSmartRoutePlan(
         ) < 0.35
     );
 
-    if (tooCloseToExisting) {
+    if (nearbyExistingSegment) {
+      mergeSkillIntoSegment(nearbyExistingSegment, focusLabels);
       continue;
     }
 
-    const normalizedStop = await normalizeStopPoint(resolved);
+    const normalizedStop = await normalizeStopPoint(resolved, {
+      preferredAddress: featureMatch.feature.addressHint
+    });
+    const verifiedMovementLabel =
+      resolvedTag === "signalized-left" && featureMatch.feature.addressHint?.startsWith("Left from ")
+        ? featureMatch.feature.addressHint
+        : undefined;
+    const resolvedReasonBase =
+      verifiedMovementLabel
+        ? `Verified left-turn movement: ${verifiedMovementLabel}. ${activeCandidate.reason}`
+        : activeCandidate.reason;
 
     segments.push({
       id: `${target.skillId}-${segments.length}`,
       tag: resolvedTag,
-      title: buildSkillFocusedTitle(resolvedTag, focusLabels) || candidate.title,
+      title: verifiedMovementLabel ?? buildSkillFocusedTitle(resolvedTag, focusLabels) ?? activeCandidate.title,
       address: normalizedStop.address,
-      reason: featureMatch
-        ? candidate.reason
-        : `${candidate.reason} Preview this stop in Maps to confirm it matches the intended maneuver before driving it.`,
+      reason: resolvedReasonBase,
       focusSkillLabels: focusLabels,
       etaMinutes: 5 + segments.length * 6,
       latitude: normalizedStop.latitude,
       longitude: normalizedStop.longitude,
       source: "resolved",
-      verificationStatus: featureMatch ? "verified" : "approximate"
+      verificationStatus: "verified"
     });
-  }
-
-  const coveredSkillLabels = new Set(segments.flatMap((segment) => segment.focusSkillLabels ?? []));
-  const uncoveredSkillTargets = skillTargets.filter((target) => !coveredSkillLabels.has(target.skillLabel));
-  const approximateFallbackTargets = uncoveredSkillTargets.filter((target) => !isStrictSkillTarget(target));
-  const fallbackSegments = buildFallbackSegmentsNearStart(
-    startPoint,
-    approximateFallbackTargets,
-    request.startLocation,
-    tagFocusMap
-  );
-
-  for (const fallbackSegment of fallbackSegments) {
-    const tooCloseToExisting = segments.some(
-      (segment) =>
-        distanceKm(
-          { latitude: segment.latitude, longitude: segment.longitude },
-          { latitude: fallbackSegment.latitude, longitude: fallbackSegment.longitude }
-        ) < 0.25
-    );
-
-    if (tooCloseToExisting) {
-      continue;
-    }
-
-    const normalizedFallback = await normalizeStopPoint({
-      latitude: fallbackSegment.latitude,
-      longitude: fallbackSegment.longitude,
-      address: fallbackSegment.address
-    });
-
-    segments.push({
-      id: `${fallbackSegment.tag}-${segments.length}`,
-      tag: fallbackSegment.tag,
-      title: fallbackSegment.title,
-      address: normalizedFallback.address,
-      reason: fallbackSegment.reason,
-      focusSkillLabels: [fallbackSegment.skillLabel],
-      etaMinutes: fallbackSegment.etaMinutes,
-      latitude: normalizedFallback.latitude,
-      longitude: normalizedFallback.longitude,
-      source: "fallback",
-      verificationStatus: "approximate"
-    });
-  }
-
-  const finalCoveredSkillLabels = new Set(segments.flatMap((segment) => segment.focusSkillLabels ?? []));
-  const missingSkillTargets = skillTargets.filter((target) => !finalCoveredSkillLabels.has(target.skillLabel));
-  const strictMissingSkillTargets = missingSkillTargets.filter((target) => isStrictSkillTarget(target));
-
-  if (strictMissingSkillTargets.length) {
-    warnings.add(
-      `Couldn't verify nearby practice stops for ${formatSkillLabelList(
-        strictMissingSkillTargets.map((target) => target.skillLabel)
-      )}. Try a more specific start point or preview nearby intersections in Maps before practicing that skill.`
-    );
-  }
-
-  if (segments.some((segment) => segment.verificationStatus !== "verified")) {
-    warnings.add(
-      "Some stops are approximate area suggestions instead of map-verified maneuvers. Open each stop in Maps before using it for a skill-specific practice drive."
-    );
   }
 
   if (!segments.length) {
-    return generateRoutePlan(skills, recommendations, request);
+    throw new RouteGenerationError("RoadReady could not verify a route for that start point yet. Try a more specific location.");
   }
 
   const estimatedMinutes = request.difficulty === "gentle" ? 18 : request.difficulty === "stretch" ? 30 : 24;
@@ -1150,6 +2444,19 @@ export async function generateSmartRoutePlan(
     startLocation: request.startLocation,
     segments
   });
+
+  if (!roadRoute) {
+    throw new RouteGenerationError(
+      "RoadReady planned verified practice stops but could not connect them into a drivable road route from this start point. Try a nearby intersection or a slightly different starting point."
+    );
+  }
+
+  const aiGuidance = await buildRouteGuidanceWithOpenAI(request, recommendations, {
+    difficulty: request.difficulty,
+    estimatedMinutes,
+    segments
+  });
+  const usedAI = usedAIPlanning || Boolean(aiGuidance);
 
   return {
     id: `route-${Math.random().toString(36).slice(2, 8)}`,
@@ -1160,12 +2467,13 @@ export async function generateSmartRoutePlan(
     estimatedMinutes,
     difficulty: request.difficulty,
     prioritySkillIds: request.skillIds,
-    explanation: buildExplanation(request, recommendations),
+    explanation: aiGuidance?.explanation ?? buildExplanation(request, recommendations),
+    coachNote: aiGuidance?.coachNote ?? buildFallbackCoachNote({ difficulty: request.difficulty, segments }),
     segments,
-    routePath: roadRoute?.routePath,
-    routeLegs: roadRoute?.routeLegs,
-    generationSource: candidates.some((candidate) => candidate.source === "ai") ? "ai-assisted" : "rules-based",
-    routingSource: roadRoute ? "road-route" : "straight-line",
-    warnings: warnings.size ? [...warnings] : undefined
+    routePath: roadRoute.routePath,
+    routeLegs: roadRoute.routeLegs,
+    generationSource: usedAI ? "ai-assisted" : "rules-based",
+    routingSource: "road-route",
+    approvalStatus: "pending"
   };
 }
